@@ -1,0 +1,55 @@
+<%-- Reference .lhtml page. Recommended shape: logic first, markup after. --%>
+<%
+    -- ── Logic block: no output emitted here ──────────────────────────────────
+    local name = httpd.get_param("name") or "world"
+
+    local items = {
+        { sku = "A-100", label = "Widget",  qty = 3 },
+        { sku = "B-220", label = "Sprocket", qty = 0 },
+        { sku = "C-045", label = "Flange",  qty = 12 },
+    }
+
+    local total = 0
+    for _, it in ipairs(items) do total = total + it.qty end
+%>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hello, <%= name %></title>
+  <style>
+    body  { font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 40rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th,td { text-align: left; padding: .4rem .6rem; border-bottom: 1px solid #ddd; }
+    .out  { color: #b00; }
+  </style>
+</head>
+<body>
+  <h1>Hello, <%= name %></h1>
+  <p>Try <a href="?name=Marcin">?name=Marcin</a> — <%= name %> is HTML-escaped on output.</p>
+
+  <table>
+    <thead><tr><th>SKU</th><th>Item</th><th>Qty</th></tr></thead>
+    <tbody>
+<%  for _, it in ipairs(items) do %>
+      <tr>
+        <td><code><%= it.sku %></code></td>
+        <td><%= it.label %></td>
+<%      if it.qty == 0 then %>
+        <td class="out">out of stock</td>
+<%      else %>
+        <td><%= it.qty %></td>
+<%      end %>
+      </tr>
+<%  end %>
+    </tbody>
+  </table>
+
+  <p>Total units: <strong><%= total %></strong></p>
+
+  <%-- <%! %> writes raw, unescaped output — only for markup you generate yourself. --%>
+  <p><%! total > 10 and "<em>Stock is healthy.</em>" or "<em>Reorder soon.</em>" %></p>
+
+  <footer><small><%= httpd.method() %> <%= httpd.path() %></small></footer>
+</body>
+</html>
