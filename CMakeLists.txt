@@ -74,6 +74,21 @@ if(HAVE_LUA)
     )
 endif()
 
+# ── Tests ─────────────────────────────────────────────────────────────────────
+enable_testing()
+
+add_executable(unit_tests tests/unit_tests.cpp)
+target_compile_options(unit_tests PRIVATE -fvisibility=hidden)
+target_link_libraries(unit_tests PRIVATE httpd_core)
+add_test(NAME unit COMMAND unit_tests)
+
+# End-to-end HTTP behaviour: driven with curl against a real server instance.
+# Needs curl; skips TLS/HTTP2 cases when openssl(1) is unavailable.
+add_test(NAME integration
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/integration.sh
+                 $<TARGET_FILE:httpd> ${CMAKE_SOURCE_DIR}/www)
+set_tests_properties(integration PROPERTIES TIMEOUT 300)
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS httpd RUNTIME DESTINATION bin)
 if(HAVE_LUA)

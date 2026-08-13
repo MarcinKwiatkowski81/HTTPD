@@ -23,7 +23,12 @@ void Http1Parser::reset() {
 static size_t scanLine(const char* data, size_t len, std::string& out) {
     for(size_t i=0;i<len;++i) {
         if(data[i]=='\n') {
-            out.append(data,(data[i-1]=='\r'&&i>0)?i-1:i);
+            // The i>0 guard must come FIRST: && evaluates left to right, so
+            // testing data[i-1] before it reads one byte *before* the buffer
+            // whenever a read begins with LF — which happens for real whenever a
+            // line is split between its CR and its LF across two socket reads.
+            size_t take = (i>0 && data[i-1]=='\r') ? i-1 : i;
+            out.append(data,take);
             return i+1;
         }
     }
@@ -56,6 +61,12 @@ size_t Http1Parser::feed(const char* data, size_t len) {
             consumed+=n;
             // Combine any buffered prefix
             std::string full=lineBuf_+lineTmp; lineBuf_.clear();
+            // scanLine can only strip CRLF when both bytes land in the same
+            // chunk. When a line is split exactly between its CR and LF the CR
+            // is already sitting at the end of lineBuf_, so drop it here —
+            // otherwise it becomes part of the request-target or header value and
+            // the message is rejected as malformed.
+            if(!full.empty() && full.back()=='\r') full.pop_back();
 
             std::string_view line(full);
 

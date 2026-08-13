@@ -32,6 +32,7 @@
 #include <lua5.4/lua.hpp>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 #include <sstream>
 #include <string>
 #include <cstdio>
@@ -672,6 +673,18 @@ HTTPD_EXPORT const char* httpd_module_version() { return "1.0.0"; }
 
 HTTPD_EXPORT int httpd_module_init(const char* /*config*/) {
     pthread_once(&gOnce, initKey);
+
+    // Make liblua's symbols globally visible so scripts can require() Lua C
+    // extensions (luasql.sqlite3, lsqlite3, cjson, ...). The core dlopens this
+    // module RTLD_LOCAL, which keeps liblua in a local scope; an extension
+    // dlopened later by Lua's own loader would then fail with
+    // "undefined symbol: lua_gettop". RTLD_NOLOAD promotes the already-loaded
+    // library to global scope without loading a second copy, which is narrower
+    // than making every module's symbols global.
+    if(!dlopen("liblua5.4.so.0", RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD))
+        fprintf(stderr, "[LUA] warning: could not promote liblua to global scope "
+                        "(%s); require() of C extensions will fail\n",
+                dlerror() ? dlerror() : "unknown");
     printf("[LUA] Lua 5.4 module initialised (one state per I/O thread)\n");
     return 0;
 }

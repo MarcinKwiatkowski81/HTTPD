@@ -21,7 +21,22 @@ cmake --build build -j
 - HTTP/2 is reachable **only** via TLS ALPN (`-c`/`-k` required). There is no `h2c` upgrade path in the plaintext read loop.
 - To exercise TLS/H2 locally: `openssl req -x509 -newkey rsa:2048 -keyout k.pem -out c.pem -days 2 -nodes -subj /CN=localhost`, then `./build/httpd -r ./www -p 8080 -s 8443 -c c.pem -k k.pem` and `curl -k --http2 https://127.0.0.1:8443/`.
 
-There is no test suite, lint config, or formatter in the repo — `tests/`, `conf/`, and `examples/` are empty directories. Verification is manual (`curl`, `curl --http2`, browsing `www/`). 
+## Tests
+
+```bash
+ctest --test-dir build --output-on-failure   # both suites
+./build/unit_tests                          # unit only
+./tests/integration.sh ./build/httpd ./www  # end-to-end only
+```
+
+Two suites, no third-party framework (the project has no dependencies beyond OpenSSL/zlib/Lua, and tests should not add one):
+
+- **`tests/unit_tests.cpp`** — the pure logic: range parsing and clamping, range syntax validity, URL decode/encode/query, HTTP dates, ETags, header collection, `Http1Parser` (including incremental and CRLF-split delivery), HPACK round-trip and dynamic table, `CacheControl`, `HttpCache::isCacheable`, `FileCache` hit/invalidate/ceiling/eviction, and the `common.h` primitives. A few macros provide `CHECK`/`CHECK_EQ`/`CHECK_STR`; failures print file, line and both values.
+- **`tests/integration.sh`** — behaviour that only exists on the wire: status codes, conditional requests, every Range form, multipart framing verified by parsing the body and comparing each part against the file, coalescing and the part cap, large-body streaming with a peak-RSS bound, keep-alive, cache revalidation after an edit, Lua/lhtml semantics, the database sample, CGI, and TLS/HTTP2. Sections skip themselves when a prerequisite is missing (openssl, a Lua driver) rather than failing.
+
+Notes for anyone adding to these: the integration script copies `www/` into a scratch docroot so tests may mutate files freely, and range fixtures must be spaced beyond the 80-byte coalescing window or ranges merge and the assertion silently tests something else.
+
+The unit tests found two real parser bugs on their first run, both in nine lines of `scanLine`: a header or request line split exactly between its CR and its LF kept the CR and was rejected as malformed, and `(data[i-1]=='\r' && i>0)` evaluated `data[i-1]` **before** the bounds check, reading one byte before the buffer whenever a read began with LF. Both are reachable from the network by ordinary TCP segmentation.
 
 ## Architecture
 
@@ -105,6 +120,26 @@ Global `httpd` table: `write, header, status, method, path, query, get_param, ge
 **A `<%--` comment is scanned for its own `--%>` terminator, not for the first `%>`.** Scanning for `%>` ended a comment early whenever it contained a tag or a literal `%>`, and the remainder of the comment was then emitted as markup — leaking the author's notes to the client. A comment closed with a bare `%>` is still accepted for compatibility. An *unterminated* comment discards to end of template and warns on stderr; it is deliberately never emitted as literal text, since that is the same disclosure bug in another guise.
 
 Known limitation, shared with ERB/JSP: the scanner does not lex Lua string literals, so `<% local s = "50%>" %>` ends the tag inside the string and fails with a Lua syntax error naming the file and line. It fails loudly rather than corrupting output; write `"50%" .. ">"` instead.
+
+### Databases — done in Lua, not in the server
+There is deliberately **no database code in the server**. Scripts `require()` a Lua C extension, so engines are a runtime choice rather than a compile-time one:
+
+```lua
+local drv  = require("luasql.sqlite3")     -- or "luasql.postgres"
+local env  = drv.sqlite3()
+local conn = env:connect("/var/lib/app/notes.db")
+```
+
+`www/db/index.lhtml` is the working sample (a notes board). `HTTPD_DB_DRIVER=postgres` switches it to Postgres with no C++ change; on Debian/Ubuntu the drivers are `lua-sql-sqlite3` and `lua-sql-postgres`.
+
+**This only works because of one line in `httpd_module_init`.** The core dlopens modules with `RTLD_LOCAL`, which keeps liblua in a local scope, so an extension dlopened later by Lua's own loader fails with `undefined symbol: lua_gettop`. The module promotes the already-loaded liblua to global scope with `dlopen("liblua5.4.so.0", RTLD_NOW|RTLD_GLOBAL|RTLD_NOLOAD)` — narrower than making every module's symbols global, and it enables `require` for any C extension (cjson, lfs, …). Don't remove it while chasing symbol cleanliness.
+
+Two things the sample is shaped around, both easy to get wrong:
+
+- **LuaSQL has no prepared statements** — no `prepare`, no `bind`, only `conn:escape()`. Values are interpolated into SQL text, so escaping is the only barrier between a request parameter and arbitrary SQL. The sample funnels *all* interpolation through one `q()` helper for exactly that reason; scattering `conn:escape()` across call sites is how one gets forgotten. If you want bound parameters instead, `lua-lsqlite3` offers `prepare`/`bind_values` with the same require-based approach.
+- **`conn:execute()` returns `nil, err` rather than raising**, so an unchecked call fails silently and renders an empty page. The sample wraps it in `must()`.
+
+Keep the database file **outside the docroot**. A `.db` under `www/` is downloadable over HTTP; the sample defaults to `/tmp/httpd-notes.db` and the integration suite asserts the file is not web-reachable.
 
 `.lhtml` is the intended way to write pages: static-by-default markup with inline dynamic blocks, PHP-style. `www/example.lhtml` is the reference page (logic block up top, markup below). `www/app/{index,login,logout}.lua` is the reference *app* (cookie `HTTPSID` + session store) and writes markup from Lua via `httpd.write` — the older, more verbose style. `www/hello.lua`, `www/counter.lua` are smaller samples.
 

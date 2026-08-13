@@ -1,0 +1,175 @@
+<%--
+    Sample: a notes board backed by a database, using LuaSQL from Lua alone.
+    No database code exists in the server — this page require()s the driver.
+
+    Switch engines without touching C++:
+      HTTPD_DB_DRIVER=sqlite3   (default)  HTTPD_DB_PATH=/var/lib/app/notes.db
+      HTTPD_DB_DRIVER=postgres             HTTPD_DB_NAME/USER/PASS/HOST/PORT
+
+    IMPORTANT — LuaSQL has no prepared statements: no prepare(), no bind().
+    Every value is interpolated into a SQL string, so escaping is the only thing
+    standing between a request parameter and arbitrary SQL. That is why all
+    interpolation below goes through the single q() helper: one place to be
+    correct, and nothing to forget at a call site.
+--%>
+<%
+    local DRIVER = os.getenv("HTTPD_DB_DRIVER") or "sqlite3"
+
+    local ok, drv = pcall(require, "luasql." .. DRIVER)
+    if not ok then
+        httpd.status(500)
+        httpd.write("<h1>500 — LuaSQL driver unavailable</h1><pre>"
+                    .. httpd.escape_html(tostring(drv)) .. "</pre>"
+                    .. "<p>Install it, e.g. <code>apt install lua-sql-"
+                    .. httpd.escape_html(DRIVER) .. "</code>.</p>")
+        return
+    end
+
+    -- The env constructor is named after the driver: drv.sqlite3(), drv.postgres()
+    local env = drv[DRIVER]()
+    local conn, cerr
+    if DRIVER == "postgres" then
+        conn, cerr = env:connect(os.getenv("HTTPD_DB_NAME") or "httpd_demo",
+                                 os.getenv("HTTPD_DB_USER") or "postgres",
+                                 os.getenv("HTTPD_DB_PASS") or "",
+                                 os.getenv("HTTPD_DB_HOST") or "127.0.0.1",
+                                 tonumber(os.getenv("HTTPD_DB_PORT") or "5432"))
+    else
+        -- Keep the file OUTSIDE the docroot: a .db under www/ is downloadable.
+        conn, cerr = env:connect(os.getenv("HTTPD_DB_PATH") or "/tmp/httpd-notes.db")
+    end
+    if not conn then
+        httpd.status(500)
+        httpd.write("<h1>500 — cannot connect</h1><pre>"
+                    .. httpd.escape_html(tostring(cerr)) .. "</pre>")
+        env:close()
+        return
+    end
+
+    -- ── The one place that turns a Lua value into SQL text ────────────────────
+    -- Returns a quoted, escaped literal, or NULL. Never concatenate a request
+    -- value into SQL without going through this.
+    local function q(v)
+        if v == nil then return "NULL" end
+        return "'" .. conn:escape(tostring(v)) .. "'"
+    end
+
+    -- LuaSQL returns nil+err rather than raising, so every call is checked;
+    -- an unchecked execute() fails silently and renders an empty page.
+    local function must(sql)
+        local res, err = conn:execute(sql)
+        if res == nil then
+            httpd.status(500)
+            httpd.write("<h1>500 — query failed</h1><pre>"
+                        .. httpd.escape_html(tostring(err)) .. "</pre><pre>"
+                        .. httpd.escape_html(sql) .. "</pre>")
+            error("sql: " .. tostring(err), 0)
+        end
+        return res
+    end
+
+    local AUTOINC = (DRIVER == "postgres") and "SERIAL PRIMARY KEY"
+                                           or  "INTEGER PRIMARY KEY AUTOINCREMENT"
+    must("CREATE TABLE IF NOT EXISTS notes (" ..
+         "  id " .. AUTOINC .. "," ..
+         "  author TEXT NOT NULL," ..
+         "  body   TEXT NOT NULL," ..
+         "  created TEXT NOT NULL" ..
+         ")")
+
+    local notice, prefill = nil, ""
+    if httpd.method() == "POST" then
+        local form   = httpd.parse_form(httpd.body())
+        local author = (form.author or ""):sub(1, 60)
+        local body   = (form.body   or ""):sub(1, 500)
+        prefill = author
+
+        if author == "" or body == "" then
+            notice = "Both a name and a note are required."
+        else
+            must(string.format(
+                "INSERT INTO notes(author, body, created) VALUES(%s, %s, %s)",
+                q(author), q(body), q(os.date("!%Y-%m-%d %H:%M:%S"))))
+            conn:close(); env:close()
+            -- Redirect after POST so a reload does not insert the note twice.
+            httpd.redirect("/db/")
+            return
+        end
+    end
+
+    -- Reading rows: execute() hands back a cursor; fetch({}, "a") fills a table
+    -- keyed by column name and returns nil when the result set is exhausted.
+    local notes = {}
+    local cur = must("SELECT id, author, body, created FROM notes " ..
+                     "ORDER BY id DESC LIMIT 25")
+    if type(cur) ~= "number" then
+        local row = cur:fetch({}, "a")
+        while row do
+            notes[#notes+1] = {
+                id = row.id, author = row.author,
+                body = row.body, created = row.created,
+            }
+            row = cur:fetch({}, "a")
+        end
+        cur:close()
+    end
+
+    local total = 0
+    local ccur = must("SELECT COUNT(*) AS n FROM notes")
+    if type(ccur) ~= "number" then
+        local r = ccur:fetch({}, "a")
+        total = tonumber(r and r.n) or 0
+        ccur:close()
+    end
+
+    conn:close()
+    env:close()
+%>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Notes — LuaSQL sample</title>
+  <style>
+    body   { font: 15px/1.55 system-ui, sans-serif; margin: 2rem auto; max-width: 42rem; }
+    form   { display: grid; gap: .5rem; margin: 1.5rem 0; }
+    input, textarea { font: inherit; padding: .45rem; border: 1px solid #bbb; border-radius: 4px; }
+    button { font: inherit; padding: .45rem 1rem; width: max-content; }
+    .note  { border-top: 1px solid #e3e3e3; padding: .7rem 0; }
+    .meta  { color: #666; font-size: .85em; }
+    .empty { color: #666; font-style: italic; }
+    .notice{ background: #fff4d6; border: 1px solid #e0c675; padding: .5rem .7rem; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Notes</h1>
+  <p class="meta"><%= total %> note(s) · driver <code><%= DRIVER %></code></p>
+
+<% if notice then %>
+  <p class="notice"><%= notice %></p>
+<% end %>
+
+  <form method="post" action="/db/">
+    <input name="author" placeholder="Your name" maxlength="60" value="<%= prefill %>">
+    <textarea name="body" rows="3" placeholder="Your note" maxlength="500"></textarea>
+    <button type="submit">Add note</button>
+  </form>
+
+<% if #notes == 0 then %>
+  <p class="empty">No notes yet — add the first one.</p>
+<% else %>
+<%   for _, n in ipairs(notes) do %>
+  <div class="note">
+    <div><%= n.body %></div>
+    <div class="meta">#<%= n.id %> by <%= n.author %> · <%= n.created %></div>
+  </div>
+<%   end %>
+<% end %>
+
+  <p class="meta">
+    Post <code>Robert'); DROP TABLE notes;--</code> as a name: it is stored and
+    shown as literal text. The quote is neutralised by <code>conn:escape()</code>
+    on the way in and by <code>&lt;%= %&gt;</code> escaping on the way out.
+  </p>
+</body>
+</html>
