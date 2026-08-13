@@ -104,6 +104,9 @@ static int l_query(lua_State* L) {
 }
 
 // httpd.get_param(name)  →  decoded query-string value or ""
+// Absent values return nil, not "". An empty string is truthy in Lua, so
+// returning "" makes the idiomatic `httpd.get_param("x") or "default"` never
+// take the default — silently yielding empty output instead.
 static int l_get_param(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     if(auto* c = ctx(L)) if(c->rctx && c->rctx->req) {
@@ -111,7 +114,7 @@ static int l_get_param(lua_State* L) {
         auto it = params.find(name);
         if(it != params.end()) { lua_pushstring(L, it->second.c_str()); return 1; }
     }
-    lua_pushstring(L, ""); return 1;
+    lua_pushnil(L); return 1;
 }
 
 // httpd.get_header(name)
@@ -119,9 +122,11 @@ static int l_get_header(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     if(auto* c = ctx(L)) if(c->rctx && c->rctx->req) {
         auto v = c->rctx->req->headers.get(name);
-        lua_pushlstring(L, v.data(), v.size()); return 1;
+        // headers.get() returns an empty view for a missing header, so an empty
+        // result here means absent — report it as nil for consistency.
+        if(!v.empty()) { lua_pushlstring(L, v.data(), v.size()); return 1; }
     }
-    lua_pushstring(L, ""); return 1;
+    lua_pushnil(L); return 1;
 }
 
 // httpd.get_cookie(name)
@@ -132,7 +137,7 @@ static int l_get_cookie(lua_State* L) {
         if(it != c->rctx->req->cookies.end())
             { lua_pushstring(L, it->second.c_str()); return 1; }
     }
-    lua_pushstring(L, ""); return 1;
+    lua_pushnil(L); return 1;
 }
 
 // httpd.set_cookie(name, value [, opts_table])
@@ -193,8 +198,10 @@ static int l_redirect(lua_State* L) {
 }
 
 // httpd.escape_html(str)
+// Tolerates nil (yielding ""), so a missing request value passed straight in
+// renders as empty rather than raising and turning the page into a 500.
 static int l_escape_html(lua_State* L) {
-    size_t len; const char* s = luaL_checklstring(L, 1, &len);
+    size_t len; const char* s = luaL_optlstring(L, 1, "", &len);
     std::string out; out.reserve(len + 32);
     for(size_t i = 0; i < len; ++i) {
         switch(s[i]) {
@@ -212,7 +219,7 @@ static int l_escape_html(lua_State* L) {
 
 // httpd.urlencode(str)
 static int l_urlencode(lua_State* L) {
-    size_t len; const char* s = luaL_checklstring(L, 1, &len);
+    size_t len; const char* s = luaL_optlstring(L, 1, "", &len);
     auto enc = httpd::Url::urlEncode(std::string_view(s, len));
     lua_pushlstring(L, enc.data(), enc.size());
     return 1;
@@ -588,6 +595,29 @@ static std::string compileLhtml(const std::string& src,
         // Literal before this tag
         if (tag > pos) addLiteral(src.substr(pos, tag - pos));
 
+        // A comment is delimited by its own "--%>" and must be scanned for that
+        // rather than for the first "%>": a comment containing a tag (or any
+        // literal "%>") would otherwise end early and spill the remainder of its
+        // own text to the client as markup.
+        if (src.compare(tag, 4, "<%--") == 0) {
+            size_t end = src.find("--%>", tag + 4);
+            size_t skip = 4;
+            // Lenient fallback for a comment closed with a bare "%>", which the
+            // older single-pass scanner accepted.
+            if (end == std::string::npos) { end = src.find("%>", tag + 4); skip = 2; }
+            if (end == std::string::npos) {
+                // Never emit an unclosed comment. Falling back to literal text
+                // would ship the author's private notes to the client, which is
+                // the whole failure this branch exists to prevent. Warn on the
+                // server side instead, where it is actionable.
+                fprintf(stderr, "[LUA] %s: unterminated <%%-- comment; "
+                                "discarding to end of template\n", filename.c_str());
+                break;
+            }
+            pos = end + skip;      // discard entirely
+            continue;
+        }
+
         size_t end = src.find("%>", tag + 2);
         if (end == std::string::npos) {
             // Unclosed tag — treat remainder as literal
@@ -609,9 +639,6 @@ static std::string compileLhtml(const std::string& src,
             // <%! expr %> — raw (unescaped) output
             out += "do local _v=tostring((" + code.substr(1) + ") or '');"
                    " httpd.write(_v); end\n";
-
-        } else if (code.size() >= 2 && code[0] == '-' && code[1] == '-') {
-            // <%-- comment --%> — discard entirely
 
         } else {
             // <% code %> — execute verbatim

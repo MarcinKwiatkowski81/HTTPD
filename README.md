@@ -21,7 +21,7 @@ cmake --build build -j
 - HTTP/2 is reachable **only** via TLS ALPN (`-c`/`-k` required). There is no `h2c` upgrade path in the plaintext read loop.
 - To exercise TLS/H2 locally: `openssl req -x509 -newkey rsa:2048 -keyout k.pem -out c.pem -days 2 -nodes -subj /CN=localhost`, then `./build/httpd -r ./www -p 8080 -s 8443 -c c.pem -k k.pem` and `curl -k --http2 https://127.0.0.1:8443/`.
 
-There is no test suite, lint config, or formatter in the repo — `tests/`, `conf/`, and `examples/` are empty directories. Verification is manual (`curl`, `curl --http2`, browsing `www/`). Don't invent a test command; if a change needs coverage, say so.
+There is no test suite, lint config, or formatter in the repo — `tests/`, `conf/`, and `examples/` are empty directories. Verification is manual (`curl`, `curl --http2`, browsing `www/`). 
 
 ## Architecture
 
@@ -96,9 +96,15 @@ Claims extensions `lua`, `luax`, `lhtml`. One `lua_State` per I/O thread, cached
 
 Measured on a 41 KB / 300-row template (`-w 1 -t 4`, `ab -n 3000 -c 8`): 558 → ~3900-4400 req/s. That ~7× is real because the cache removes *CPU* work (LHTML compile + Lua parse), not just I/O.
 
-Global `httpd` table: `write, header, status, method, path, query, get_param, get_header, get_cookie, set_cookie, body, redirect, escape_html, urlencode, json_encode, session_create, session_get, session_destroy, parse_form`. `session_create(username)` enforces one session per user by evicting the user's previous sid. Output accumulates in `LuaReqCtx::output` and is committed to `resp.body` after `lua_pcall`; Lua load/runtime errors become a 500 with the error text in the body.
+Global `httpd` table: `write, header, status, method, path, query, get_param, get_header, get_cookie, set_cookie, body, redirect, escape_html, urlencode, json_encode, session_create, session_get, session_destroy, parse_form`.
+
+**`get_param`, `get_header` and `get_cookie` return `nil` when the value is absent, not `""`.** This matters because `""` is truthy in Lua, so returning it made the idiomatic `httpd.get_param("name") or "world"` never take its default — the page silently rendered an empty string instead. Scripts that predate this used `if v and v ~= "" then`, which is correct either way. `escape_html` and `urlencode` accept `nil` and yield `""`, so passing a missing value straight through renders empty rather than raising and turning the page into a 500. `session_create(username)` enforces one session per user by evicting the user's previous sid. Output accumulates in `LuaReqCtx::output` and is committed to `resp.body` after `lua_pcall`; Lua load/runtime errors become a 500 with the error text in the body.
 
 `.lhtml` files are compiled to a Lua chunk by `compileLhtml` before loading: `<% code %>`, `<%= escaped %>`, `<%! raw %>`, `<%-- comment --%>`. Literal text is emitted as `httpd.write([=*[ ... ]=*])` with the bracket level chosen to avoid collisions and a synthetic leading newline to defeat Lua's first-newline stripping — preserve both tricks if you touch it.
+
+**A `<%--` comment is scanned for its own `--%>` terminator, not for the first `%>`.** Scanning for `%>` ended a comment early whenever it contained a tag or a literal `%>`, and the remainder of the comment was then emitted as markup — leaking the author's notes to the client. A comment closed with a bare `%>` is still accepted for compatibility. An *unterminated* comment discards to end of template and warns on stderr; it is deliberately never emitted as literal text, since that is the same disclosure bug in another guise.
+
+Known limitation, shared with ERB/JSP: the scanner does not lex Lua string literals, so `<% local s = "50%>" %>` ends the tag inside the string and fails with a Lua syntax error naming the file and line. It fails loudly rather than corrupting output; write `"50%" .. ">"` instead.
 
 `.lhtml` is the intended way to write pages: static-by-default markup with inline dynamic blocks, PHP-style. `www/example.lhtml` is the reference page (logic block up top, markup below). `www/app/{index,login,logout}.lua` is the reference *app* (cookie `HTTPSID` + session store) and writes markup from Lua via `httpd.write` — the older, more verbose style. `www/hello.lua`, `www/counter.lua` are smaller samples.
 

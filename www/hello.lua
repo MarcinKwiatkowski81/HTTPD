@@ -21,7 +21,7 @@ httpd.write("<p><b>UA:</b> "      .. httpd.escape_html(httpd.get_header("user-ag
 
 -- URL params
 local name = httpd.get_param("name")
-if name ~= "" then
+if name and name ~= "" then
     httpd.write("<p><b>Hello, " .. httpd.escape_html(name) .. "!</b></p>\n")
 end
 
