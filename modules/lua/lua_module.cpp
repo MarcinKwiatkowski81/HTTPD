@@ -12,8 +12,9 @@
 //   httpd.method()                -- request method string
 //   httpd.path()                  -- request path
 //   httpd.query()                 -- raw query string
-//   httpd.get_param(name)         -- decoded query-string parameter
-//   httpd.get_header(name)        -- request header value
+//   httpd.get_param(name)         -- decoded query-string parameter (nil if absent)
+//   httpd.get_params()            -- table of ALL query-string params
+//   httpd.get_header(name)        -- request header value (nil if absent)
 //   httpd.get_cookie(name)        -- cookie value
 //   httpd.set_cookie(name,val,{}) -- set response cookie
 //   httpd.body()                  -- raw request body
@@ -21,9 +22,15 @@
 //   httpd.escape_html(str)        -- HTML-escape a string
 //   httpd.urlencode(str)          -- percent-encode a string
 //   httpd.json_encode(table)      -- simple JSON serialiser
-//
-// All exported C symbols carry __attribute__((visibility("default"))) so they
-// are reachable via dlsym() regardless of the caller's -fvisibility setting.
+//   httpd.log(level, msg)         -- log to stderr + syslog
+//   httpd.remote_addr()           -- client IP (respects X-Forwarded-For)
+//   httpd.script_dir()            -- directory of the running script
+//   httpd.session_create(user)    -- create/replace session → sid
+//   httpd.session_get(sid)        -- sid → username | nil
+//   httpd.session_destroy(sid)    -- invalidate session
+//   httpd.session_list()          -- all active sessions (admin)
+//   httpd.session_count()         -- integer
+//   httpd.parse_form(body)        -- URL-form-encoded → table
 
 #include "../../include/Module.h"
 #include "../../include/HttpCommon.h"
@@ -35,12 +42,13 @@
 #include <dlfcn.h>
 #include <sstream>
 #include <string>
+#include <vector>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <pthread.h>
-#include <sstream>
+#include <syslog.h>
 
 // ── Visibility macro ──────────────────────────────────────────────────────────
 #define HTTPD_EXPORT extern "C" __attribute__((visibility("default")))
@@ -54,6 +62,11 @@ struct LuaReqCtx {
 static pthread_key_t  gCtxKey;
 static pthread_once_t gOnce = PTHREAD_ONCE_INIT;
 static void initKey() { pthread_key_create(&gCtxKey, nullptr); }
+
+// Working directory captured at module init — used to pin package.path so that
+// require('lua.db') resolves correctly even in forked child processes where the
+// OS-reported cwd may differ from the project root.
+static std::string gModuleCwd;
 
 // ── Lua API: httpd.* ──────────────────────────────────────────────────────────
 
@@ -104,10 +117,7 @@ static int l_query(lua_State* L) {
     lua_pushstring(L, ""); return 1;
 }
 
-// httpd.get_param(name)  →  decoded query-string value or ""
-// Absent values return nil, not "". An empty string is truthy in Lua, so
-// returning "" makes the idiomatic `httpd.get_param("x") or "default"` never
-// take the default — silently yielding empty output instead.
+// httpd.get_param(name)  →  decoded query-string value or nil (absent → nil)
 static int l_get_param(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     if(auto* c = ctx(L)) if(c->rctx && c->rctx->req) {
@@ -118,13 +128,25 @@ static int l_get_param(lua_State* L) {
     lua_pushnil(L); return 1;
 }
 
+// httpd.get_params() → table of ALL decoded query-string parameters
+static int l_get_params(lua_State* L) {
+    lua_newtable(L);
+    if(auto* c = ctx(L)) if(c->rctx && c->rctx->req) {
+        auto params = c->rctx->req->url.parseQuery();
+        for(auto& [k, v] : params) {
+            lua_pushlstring(L, k.data(), k.size());
+            lua_pushlstring(L, v.data(), v.size());
+            lua_settable(L, -3);
+        }
+    }
+    return 1;
+}
+
 // httpd.get_header(name)
 static int l_get_header(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     if(auto* c = ctx(L)) if(c->rctx && c->rctx->req) {
         auto v = c->rctx->req->headers.get(name);
-        // headers.get() returns an empty view for a missing header, so an empty
-        // result here means absent — report it as nil for consistency.
         if(!v.empty()) { lua_pushlstring(L, v.data(), v.size()); return 1; }
     }
     lua_pushnil(L); return 1;
@@ -142,7 +164,6 @@ static int l_get_cookie(lua_State* L) {
 }
 
 // httpd.set_cookie(name, value [, opts_table])
-// opts: { path="/", maxAge=N, secure=true, httpOnly=true, sameSite="Lax", domain="" }
 static int l_set_cookie(lua_State* L) {
     const char* name  = luaL_checkstring(L, 1);
     const char* value = luaL_checkstring(L, 2);
@@ -165,10 +186,10 @@ static int l_set_cookie(lua_State* L) {
             bool r = lua_toboolean(L,-1);
             lua_pop(L,1); return r;
         };
-        auto p = getStr("path");   if(!p.empty())       ck.path     = p;
-        auto d = getStr("domain"); if(!d.empty())       ck.domain   = d;
-        auto ss= getStr("sameSite");if(!ss.empty())     ck.sameSite = ss;
-        int64_t ma = getInt("maxAge"); if(ma >= 0)      ck.maxAge   = ma;
+        auto p = getStr("path");    if(!p.empty())  ck.path     = p;
+        auto d = getStr("domain");  if(!d.empty())  ck.domain   = d;
+        auto ss= getStr("sameSite");if(!ss.empty()) ck.sameSite = ss;
+        int64_t ma = getInt("maxAge"); if(ma >= 0)  ck.maxAge   = ma;
         ck.secure   = getBool("secure");
         ck.httpOnly = getBool("httpOnly");
     }
@@ -199,8 +220,6 @@ static int l_redirect(lua_State* L) {
 }
 
 // httpd.escape_html(str)
-// Tolerates nil (yielding ""), so a missing request value passed straight in
-// renders as empty rather than raising and turning the page into a 500.
 static int l_escape_html(lua_State* L) {
     size_t len; const char* s = luaL_optlstring(L, 1, "", &len);
     std::string out; out.reserve(len + 32);
@@ -226,8 +245,42 @@ static int l_urlencode(lua_State* L) {
     return 1;
 }
 
-// httpd.json_encode(value)  — handles nil/bool/number/string/array-table/dict-table
-static int l_json_encode(lua_State* L);  // forward
+// httpd.log(level, msg)  — "debug"|"info"|"warn"|"error"
+static int l_log(lua_State* L) {
+    const char* level = luaL_optstring(L, 1, "info");
+    size_t len; const char* msg = luaL_checklstring(L, 2, &len);
+    int prio = LOG_INFO;
+    if     (strcmp(level,"debug")==0) prio = LOG_DEBUG;
+    else if(strcmp(level,"warn") ==0) prio = LOG_WARNING;
+    else if(strcmp(level,"error")==0) prio = LOG_ERR;
+    fprintf(stderr, "[LUA][%s] %.*s\n", level, (int)len, msg);
+    syslog(prio, "[lua] %.*s", (int)len, msg);
+    return 0;
+}
+
+// httpd.remote_addr() → client IP (respects X-Forwarded-For / X-Real-IP)
+static int l_remote_addr(lua_State* L) {
+    if(auto* c = ctx(L)) if(c->rctx && c->rctx->req) {
+        auto xff = c->rctx->req->headers.get("x-forwarded-for");
+        if(!xff.empty()) { lua_pushlstring(L, xff.data(), xff.size()); return 1; }
+        auto xri = c->rctx->req->headers.get("x-real-ip");
+        if(!xri.empty()) { lua_pushlstring(L, xri.data(), xri.size()); return 1; }
+    }
+    lua_pushstring(L, "127.0.0.1"); return 1;
+}
+
+// httpd.script_dir() → directory of the executing script (trailing slash)
+static int l_script_dir(lua_State* L) {
+    if(auto* c = ctx(L)) if(c->rctx) {
+        const std::string& sp = c->rctx->scriptPath;
+        auto slash = sp.rfind('/');
+        std::string dir = (slash != std::string::npos) ? sp.substr(0, slash+1) : "./";
+        lua_pushlstring(L, dir.data(), dir.size()); return 1;
+    }
+    lua_pushstring(L, "./"); return 1;
+}
+
+// httpd.json_encode(value)
 static std::string jsonEncodeValue(lua_State* L, int idx, int depth);
 
 static std::string jsonEncodeValue(lua_State* L, int idx, int depth) {
@@ -251,13 +304,12 @@ static std::string jsonEncodeValue(lua_State* L, int idx, int depth) {
             else if(c == '\n') out += "\\n";
             else if(c == '\r') out += "\\r";
             else if(c == '\t') out += "\\t";
-            else if(c < 0x20) { char esc[8]; snprintf(esc,sizeof esc,"\\u%04x",c); out+=esc; }
+            else if(c < 0x20)  { char esc[8]; snprintf(esc,sizeof esc,"\\u%04x",c); out+=esc; }
             else               out += (char)c;
         }
         out += '"'; return out;
     }
     if(t == LUA_TTABLE) {
-        // Detect array vs object
         lua_len(L, idx);
         lua_Integer n = lua_tointeger(L, -1); lua_pop(L, 1);
         bool isArray = (n > 0);
@@ -275,17 +327,14 @@ static std::string jsonEncodeValue(lua_State* L, int idx, int depth) {
             bool first = true;
             lua_pushnil(L);
             while(lua_next(L, idx)) {
-                if(!first) out += ',';
-                first = false;
-                // key
+                if(!first) out += ','; first = false;
                 lua_pushvalue(L, -2);
                 size_t kl; const char* k = lua_tolstring(L, -1, &kl);
                 out += '"'; if(k) out += std::string(k,kl); out += '"';
                 out += ':';
-                lua_pop(L, 1); // pop key copy
-                // value
+                lua_pop(L, 1);
                 out += jsonEncodeValue(L, -1, depth+1);
-                lua_pop(L, 1); // pop value
+                lua_pop(L, 1);
             }
             out += '}'; return out;
         }
@@ -300,25 +349,31 @@ static int l_json_encode(lua_State* L) {
     return 1;
 }
 
-
-// ── Thread-safe session store ─────────────────────────────────────────────────
-// Shared across ALL threads / Lua states. Enforces one session per user.
+// ── Thread-safe in-process session store ─────────────────────────────────────
+// Shared across all I/O threads (mutex-protected). When WORKERS=1 (default for
+// FinApp) this covers all requests. For multi-worker deployments, move to
+// SQLite-backed sessions in lua/middleware/auth.lua using db.exec().
+//
+// TTL: 24 h idle expiry, enforced lazily on session_create() when map > 4096.
 
 struct Session {
     std::string username;
-    int64_t     createdWallMs  = 0;
+    int64_t     createdWallMs    = 0;
     int64_t     lastAccessWallMs = 0;
 };
 
-static std::mutex                              gSessionMu;
-static std::unordered_map<std::string,Session> gSessions;   // sid → Session
-static std::unordered_map<std::string,std::string> gUserSid; // username → sid
+static std::mutex                                  gSessionMu;
+static std::unordered_map<std::string, Session>    gSessions;   // sid → Session
+static std::unordered_map<std::string, std::string> gUserSid;   // username → sid
+
+static constexpr int64_t kSessionTTLMs  = 86400LL * 1000; // 24 h
+static constexpr size_t  kReapThreshold = 4096;
 
 static std::string generateSid() {
     uint8_t buf[24] = {};
     FILE* f = fopen("/dev/urandom", "rb");
     if(f) { (void)fread(buf, 1, sizeof buf, f); fclose(f); }
-    else   { /* fallback: XOR pid+time */
+    else {
         uint64_t t = (uint64_t)httpd::nowWallMs();
         uint64_t p = (uint64_t)getpid();
         for(int i=0;i<8;++i){ buf[i]=(uint8_t)(t>>(i*8)); buf[i+8]=(uint8_t)(p>>(i*8)); }
@@ -329,14 +384,24 @@ static std::string generateSid() {
     return r;
 }
 
+// Evict sessions idle for more than kSessionTTLMs. Called with gSessionMu held.
+static void reapExpiredSessions() {
+    int64_t now = httpd::nowWallMs();
+    for(auto it = gSessions.begin(); it != gSessions.end(); ) {
+        if(now - it->second.lastAccessWallMs > kSessionTTLMs) {
+            gUserSid.erase(it->second.username);
+            it = gSessions.erase(it);
+        } else { ++it; }
+    }
+}
+
 // httpd.session_create(username) → sid
-// If user already has a session, the old one is INVALIDATED (single-session rule).
 static int l_session_create(lua_State* L) {
     const char* username = luaL_checkstring(L, 1);
     std::string sid = generateSid();
     {
         std::lock_guard<std::mutex> lk(gSessionMu);
-        // Kill previous session for this user
+        if(gSessions.size() >= kReapThreshold) reapExpiredSessions();
         auto uit = gUserSid.find(username);
         if(uit != gUserSid.end()) {
             gSessions.erase(uit->second);
@@ -351,7 +416,6 @@ static int l_session_create(lua_State* L) {
 }
 
 // httpd.session_get(sid) → username | nil
-// Returns nil if sid is unknown or expired.
 static int l_session_get(lua_State* L) {
     const char* sid = luaL_optstring(L, 1, "");
     if(!sid || !*sid) { lua_pushnil(L); return 1; }
@@ -376,11 +440,32 @@ static int l_session_destroy(lua_State* L) {
     return 0;
 }
 
-// httpd.parse_form(body_str) → table  (URL-form-encoded decoder)
+// httpd.session_list() → array of { sid, username, last_access_ms }
+static int l_session_list(lua_State* L) {
+    std::lock_guard<std::mutex> lk(gSessionMu);
+    lua_newtable(L);
+    int i = 1;
+    for(auto& [sid, sess] : gSessions) {
+        lua_newtable(L);
+        lua_pushstring(L, sid.c_str());            lua_setfield(L,-2,"sid");
+        lua_pushstring(L, sess.username.c_str());  lua_setfield(L,-2,"username");
+        lua_pushinteger(L, sess.lastAccessWallMs); lua_setfield(L,-2,"last_access_ms");
+        lua_rawseti(L, -2, i++);
+    }
+    return 1;
+}
+
+// httpd.session_count() → integer
+static int l_session_count(lua_State* L) {
+    std::lock_guard<std::mutex> lk(gSessionMu);
+    lua_pushinteger(L, (lua_Integer)gSessions.size());
+    return 1;
+}
+
+// httpd.parse_form(body_str) → table
 static int l_parse_form(lua_State* L) {
     size_t len; const char* raw = luaL_checklstring(L, 1, &len);
     lua_newtable(L);
-    // Decode percent-encoded form data
     auto decode = [](const std::string& s) {
         std::string out; out.reserve(s.size());
         for(size_t i = 0; i < s.size(); ++i) {
@@ -415,47 +500,38 @@ static int l_parse_form(lua_State* L) {
 
 // ── httpd table registration ──────────────────────────────────────────────────
 static const luaL_Reg kHttpdLib[] = {
-    {"write",       l_write},
-    {"header",      l_header},
-    {"status",      l_status},
-    {"method",      l_method},
-    {"path",        l_path},
-    {"query",       l_query},
-    {"get_param",   l_get_param},
-    {"get_header",  l_get_header},
-    {"get_cookie",  l_get_cookie},
-    {"set_cookie",  l_set_cookie},
-    {"body",        l_body},
-    {"redirect",    l_redirect},
-    {"escape_html", l_escape_html},
-    {"urlencode",   l_urlencode},
-    {"json_encode",       l_json_encode},
-    // Session management
-    {"session_create",    l_session_create},
-    {"session_get",       l_session_get},
-    {"session_destroy",   l_session_destroy},
-    // Utility
-    {"parse_form",        l_parse_form},
+    {"write",          l_write},
+    {"header",         l_header},
+    {"status",         l_status},
+    {"method",         l_method},
+    {"path",           l_path},
+    {"query",          l_query},
+    {"get_param",      l_get_param},
+    {"get_params",     l_get_params},
+    {"get_header",     l_get_header},
+    {"get_cookie",     l_get_cookie},
+    {"set_cookie",     l_set_cookie},
+    {"body",           l_body},
+    {"redirect",       l_redirect},
+    {"escape_html",    l_escape_html},
+    {"urlencode",      l_urlencode},
+    {"json_encode",    l_json_encode},
+    {"log",            l_log},
+    {"remote_addr",    l_remote_addr},
+    {"script_dir",     l_script_dir},
+    {"session_create", l_session_create},
+    {"session_get",    l_session_get},
+    {"session_destroy",l_session_destroy},
+    {"session_list",   l_session_list},
+    {"session_count",  l_session_count},
+    {"parse_form",     l_parse_form},
     {nullptr, nullptr}
 };
 
-// ── Compiled-chunk cache (the PHP opcache equivalent) ────────────────────────
-//
-// Skips read + LHTML-compile + Lua-parse on a cache hit, leaving one stat() as
-// the only per-request filesystem work.
-//
-// A loaded chunk is a closure owned by exactly one lua_State and must never be
-// shared between states, so the cache is PER-STATE — which here means per I/O
-// thread. The functions live in that state's registry (which also keeps them
-// reachable from the GC); the validation stamps live in a thread_local map,
-// matching per-state lifetime because getState() pins one state per thread.
-//
-// Reusing the closure is safe: a main chunk's only upvalue is _ENV, which is
-// the state's globals table either way, and its top-level `local`s are function
-// locals that are re-initialised on every call. Globals already persisted
-// across requests because the state does; that is unchanged.
+// ── Compiled-chunk cache (per I/O thread) ────────────────────────────────────
+// Cache key: script path. Invalidated by mtime+size+inode change (stat-based).
 
-static const char* kChunkTable = "httpd.chunks";   // registry field
+static const char* kChunkTable = "httpd.chunks";
 
 struct ChunkStamp {
     dev_t  dev = 0; ino_t ino = 0; off_t size = 0;
@@ -465,17 +541,12 @@ struct ChunkStamp {
         return { st.st_dev, st.st_ino, st.st_size,
                  st.st_mtim.tv_sec, st.st_mtim.tv_nsec };
     }
-    // Nanosecond mtime + inode + size: a same-second rewrite still invalidates,
-    // and so does a replacement file that happens to match size and mtime.
     bool sameAs(const struct stat& st) const {
         return dev  == st.st_dev  && ino  == st.st_ino && size == st.st_size
             && sec  == st.st_mtim.tv_sec && nsec == st.st_mtim.tv_nsec;
     }
 };
 
-// Bounded by the number of script files on disk (a path must resolve to a real
-// file under docRoot to reach this module), so a plain flush on overflow is
-// sufficient — no LRU bookkeeping for a limit that should never be hit.
 static constexpr size_t kMaxCachedChunks = 512;
 static thread_local std::unordered_map<std::string, ChunkStamp> tChunkStamps;
 
@@ -485,41 +556,31 @@ static void resetChunkCache(lua_State* L) {
     tChunkStamps.clear();
 }
 
-// On a valid hit, leaves the chunk function on top of the stack and returns
-// true. Otherwise returns false with the stack unchanged.
-static bool pushCachedChunk(lua_State* L, const std::string& path,
-                            const struct stat& st) {
+static bool pushCachedChunk(lua_State* L, const std::string& path, const struct stat& st) {
     auto it = tChunkStamps.find(path);
     if(it == tChunkStamps.end() || !it->second.sameAs(st)) return false;
-
-    lua_getfield(L, LUA_REGISTRYINDEX, kChunkTable);          // +1 table
-    if(lua_getfield(L, -1, path.c_str()) != LUA_TFUNCTION) {  // +1 value
-        // Stamp without a function: registry and stamps disagree, so drop it.
-        lua_pop(L, 2);
-        tChunkStamps.erase(it);
-        return false;
+    lua_getfield(L, LUA_REGISTRYINDEX, kChunkTable);
+    if(lua_getfield(L, -1, path.c_str()) != LUA_TFUNCTION) {
+        lua_pop(L, 2); tChunkStamps.erase(it); return false;
     }
-    lua_remove(L, -2);                                        // drop table
+    lua_remove(L, -2);
     return true;
 }
 
-// Caches the function on top of the stack, leaving the stack as it was found.
-static void storeChunk(lua_State* L, const std::string& path,
-                       const struct stat& st) {
+static void storeChunk(lua_State* L, const std::string& path, const struct stat& st) {
     if(tChunkStamps.size() >= kMaxCachedChunks) {
-        fprintf(stderr, "[LUA] chunk cache hit %zu entries — flushing\n",
-                kMaxCachedChunks);
+        fprintf(stderr, "[LUA] chunk cache hit %zu entries — flushing\n", kMaxCachedChunks);
         resetChunkCache(L);
     }
-    lua_getfield(L, LUA_REGISTRYINDEX, kChunkTable);  // +1 table
-    lua_pushvalue(L, -2);                             // +1 copy of the function
-    lua_setfield(L, -2, path.c_str());                // table[path] = function
-    lua_pop(L, 1);                                    // drop table
+    lua_getfield(L, LUA_REGISTRYINDEX, kChunkTable);
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, path.c_str());
+    lua_pop(L, 1);
     tChunkStamps[path] = ChunkStamp::of(st);
 }
 
 // ── Per-thread Lua state pool ─────────────────────────────────────────────────
-static std::mutex              gStateMu;
+static std::mutex                              gStateMu;
 static std::unordered_map<pthread_t, lua_State*> gStates;
 
 static lua_State* getState() {
@@ -529,12 +590,43 @@ static lua_State* getState() {
         auto it = gStates.find(self);
         if(it != gStates.end()) return it->second;
     }
+
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
+
+    // ── Pin package.path to project root captured at init ──────────────────
+    // This ensures require('lua.db') resolves to <projectRoot>/lua/db.lua
+    // regardless of cwd changes in forked workers or thread-pool chdir() calls.
+    if(!gModuleCwd.empty()) {
+        lua_getglobal(L, "package");
+
+        // Lua path: project root first, then defaults
+        lua_getfield(L, -1, "path");
+        std::string curpath = lua_isstring(L,-1) ? lua_tostring(L,-1) : "";
+        lua_pop(L, 1);
+        std::string newpath =
+            gModuleCwd + "/?.lua;"          +
+            gModuleCwd + "/?/init.lua;"     +
+            curpath;
+        lua_pushstring(L, newpath.c_str());
+        lua_setfield(L, -2, "path");
+
+        // C path: add cwd for local .so overrides (lsqlite3 etc.)
+        lua_getfield(L, -1, "cpath");
+        std::string curcpath = lua_isstring(L,-1) ? lua_tostring(L,-1) : "";
+        lua_pop(L, 1);
+        std::string newcpath = gModuleCwd + "/?.so;" + curcpath;
+        lua_pushstring(L, newcpath.c_str());
+        lua_setfield(L, -2, "cpath");
+
+        lua_pop(L, 1); // pop package
+    }
+
     // Register httpd table
     luaL_newlib(L, kHttpdLib);
     lua_setglobal(L, "httpd");
     resetChunkCache(L);
+
     {
         std::lock_guard<std::mutex> lk(gStateMu);
         gStates[self] = L;
@@ -544,36 +636,17 @@ static lua_State* getState() {
 
 
 // ── LHTML template compiler ───────────────────────────────────────────────────
-//
-// Transforms a .lhtml file into an executable Lua chunk.
-// Syntax:
-//   <% code %>      — execute Lua (no automatic output)
-//   <%= expr %>     — output tostring(expr), HTML-escaped
-//   <%! expr %>     — output tostring(expr), raw (unescaped)
-//   <%-- text --%>  — template comment (stripped, never sent)
-//
-// All code blocks share the same Lua scope (one chunk per template).
-// A leading synthetic \n is inserted after every [=*[ so Lua's
-// "strip first newline" rule never eats content characters.
-
-static std::string compileLhtml(const std::string& src,
-                                  const std::string& filename) {
+static std::string compileLhtml(const std::string& src, const std::string& filename) {
     std::string out;
     out.reserve(src.size() * 2 + 256);
-
-    // Header comment — Lua uses "@name" as the chunk name in error messages
     out += "-- @" + filename + "\n";
 
-    // Emit a literal text fragment safely as a Lua long string.
-    // We choose the minimum [===[ level so no closing bracket appears in text.
-    // A synthetic leading '\n' is placed right after the opening bracket;
-    // Lua strips exactly that one '\n', so our content is preserved verbatim.
     auto addLiteral = [&](const std::string& text) {
-        if (text.empty()) return;
+        if(text.empty()) return;
         int lvl = 0;
-        for (;;) {
+        for(;;) {
             std::string close = "]" + std::string((size_t)lvl, '=') + "]";
-            if (text.find(close) == std::string::npos) break;
+            if(text.find(close) == std::string::npos) break;
             ++lvl;
         }
         std::string open  = "[" + std::string((size_t)lvl, '=') + "[";
@@ -583,108 +656,71 @@ static std::string compileLhtml(const std::string& src,
 
     size_t pos = 0;
     const size_t len = src.size();
-
-    while (pos < len) {
+    while(pos < len) {
         size_t tag = src.find("<%", pos);
+        if(tag == std::string::npos) { addLiteral(src.substr(pos)); break; }
+        if(tag > pos) addLiteral(src.substr(pos, tag - pos));
 
-        // No more tags — rest is literal
-        if (tag == std::string::npos) {
-            addLiteral(src.substr(pos));
-            break;
-        }
-
-        // Literal before this tag
-        if (tag > pos) addLiteral(src.substr(pos, tag - pos));
-
-        // A comment is delimited by its own "--%>" and must be scanned for that
-        // rather than for the first "%>": a comment containing a tag (or any
-        // literal "%>") would otherwise end early and spill the remainder of its
-        // own text to the client as markup.
-        if (src.compare(tag, 4, "<%--") == 0) {
+        if(src.compare(tag, 4, "<%--") == 0) {
             size_t end = src.find("--%>", tag + 4);
             size_t skip = 4;
-            // Lenient fallback for a comment closed with a bare "%>", which the
-            // older single-pass scanner accepted.
-            if (end == std::string::npos) { end = src.find("%>", tag + 4); skip = 2; }
-            if (end == std::string::npos) {
-                // Never emit an unclosed comment. Falling back to literal text
-                // would ship the author's private notes to the client, which is
-                // the whole failure this branch exists to prevent. Warn on the
-                // server side instead, where it is actionable.
-                fprintf(stderr, "[LUA] %s: unterminated <%%-- comment; "
-                                "discarding to end of template\n", filename.c_str());
+            if(end == std::string::npos) { end = src.find("%>", tag+4); skip = 2; }
+            if(end == std::string::npos) {
+                fprintf(stderr, "[LUA] %s: unterminated <%%-- comment\n", filename.c_str());
                 break;
             }
-            pos = end + skip;      // discard entirely
-            continue;
+            pos = end + skip; continue;
         }
 
         size_t end = src.find("%>", tag + 2);
-        if (end == std::string::npos) {
-            // Unclosed tag — treat remainder as literal
-            addLiteral(src.substr(tag));
-            break;
-        }
-
-        // Code content between <% and %>
+        if(end == std::string::npos) { addLiteral(src.substr(tag)); break; }
         std::string code = src.substr(tag + 2, end - (tag + 2));
         pos = end + 2;
 
-        if (!code.empty() && code[0] == '=') {
-            // <%= expr %> — HTML-escaped output
-            // "do local" isolates the temp variable from template scope
+        if(!code.empty() && code[0] == '=') {
             out += "do local _v=tostring((" + code.substr(1) + ") or '');"
                    " httpd.write(httpd.escape_html(_v)); end\n";
-
-        } else if (!code.empty() && code[0] == '!') {
-            // <%! expr %> — raw (unescaped) output
+        } else if(!code.empty() && code[0] == '!') {
             out += "do local _v=tostring((" + code.substr(1) + ") or '');"
                    " httpd.write(_v); end\n";
-
         } else {
-            // <% code %> — execute verbatim
-            out += code;
-            out += '\n';
+            out += code; out += '\n';
         }
     }
-
     return out;
 }
 
-// Read a whole file into a string.  Returns false on error.
 static bool readFile(const std::string& path, std::string& out) {
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    rewind(f);
-    if (sz > 0) {
-        out.resize((size_t)sz);
-        (void)fread(out.data(), 1, (size_t)sz, f);
-    }
-    fclose(f);
-    return true;
+    if(!f) return false;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+    if(sz > 0) { out.resize((size_t)sz); (void)fread(out.data(), 1, (size_t)sz, f); }
+    fclose(f); return true;
 }
 
-// ── C ABI — symbols that dlsym() must find ────────────────────────────────────
-
+// ── C ABI ─────────────────────────────────────────────────────────────────────
 HTTPD_EXPORT const char* httpd_module_name()    { return "lua"; }
 HTTPD_EXPORT const char* httpd_module_version() { return "1.0.0"; }
 
 HTTPD_EXPORT int httpd_module_init(const char* /*config*/) {
     pthread_once(&gOnce, initKey);
+    openlog("httpd-lua", LOG_PID, LOG_DAEMON);
 
-    // Make liblua's symbols globally visible so scripts can require() Lua C
-    // extensions (luasql.sqlite3, lsqlite3, cjson, ...). The core dlopens this
-    // module RTLD_LOCAL, which keeps liblua in a local scope; an extension
-    // dlopened later by Lua's own loader would then fail with
-    // "undefined symbol: lua_gettop". RTLD_NOLOAD promotes the already-loaded
-    // library to global scope without loading a second copy, which is narrower
-    // than making every module's symbols global.
+    // Capture cwd BEFORE any fork() so child processes inherit the correct path.
+    char cwdbuf[4096] = {};
+    if(getcwd(cwdbuf, sizeof cwdbuf)) {
+        gModuleCwd = cwdbuf;
+        fprintf(stderr, "[LUA] package.path root: %s\n", cwdbuf);
+    } else {
+        fprintf(stderr, "[LUA] warning: getcwd() failed — package.path may be wrong\n");
+    }
+
+    // Promote liblua5.4 to global symbol scope so C extensions loaded via
+    // require() (lsqlite3, cjson, …) can resolve lua_* symbols.
     if(!dlopen("liblua5.4.so.0", RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD))
-        fprintf(stderr, "[LUA] warning: could not promote liblua to global scope "
-                        "(%s); require() of C extensions will fail\n",
+        fprintf(stderr, "[LUA] warning: could not promote liblua to global scope (%s)\n",
                 dlerror() ? dlerror() : "unknown");
+
     printf("[LUA] Lua 5.4 module initialised (one state per I/O thread)\n");
     return 0;
 }
@@ -693,6 +729,7 @@ HTTPD_EXPORT void httpd_module_fini() {
     std::lock_guard<std::mutex> lk(gStateMu);
     for(auto& kv : gStates) lua_close(kv.second);
     gStates.clear();
+    closelog();
 }
 
 HTTPD_EXPORT const char** httpd_module_extensions() {
@@ -706,7 +743,6 @@ HTTPD_EXPORT int httpd_module_handle(httpd::RequestCtx* ctx_ptr) {
 
     lua_State* L = getState();
 
-    // Bind context to this thread
     LuaReqCtx lrc;
     lrc.rctx = ctx_ptr;
     pthread_setspecific(gCtxKey, &lrc);
@@ -715,65 +751,52 @@ HTTPD_EXPORT int httpd_module_handle(httpd::RequestCtx* ctx_ptr) {
     ctx_ptr->resp->headers.set("content-type", "text/html; charset=utf-8");
     ctx_ptr->resp->statusCode = 200;
 
-    // Stamp the file up front: this is both the cache key validation and the
-    // only filesystem call made on a cache hit. Core already stat()ed this path
-    // to route the request, but RequestCtx does not carry the result and adding
-    // a field to it would change the module ABI, so re-stat instead.
     struct stat st{};
-    bool haveStat = (stat(ctx_ptr->scriptPath.c_str(), &st) == 0
-                     && S_ISREG(st.st_mode));
+    bool haveStat = (stat(ctx_ptr->scriptPath.c_str(), &st) == 0 && S_ISREG(st.st_mode));
 
     int rc = LUA_OK;
     if(!(haveStat && pushCachedChunk(L, ctx_ptr->scriptPath, st))) {
-        // Determine whether this is a plain .lua file or a .lhtml template
         bool isLhtml = false;
         {
             const std::string& sp = ctx_ptr->scriptPath;
             auto dot = sp.rfind('.');
-            if (dot != std::string::npos) {
+            if(dot != std::string::npos) {
                 std::string ext = sp.substr(dot + 1);
-                for (auto& c : ext) c = (char)tolower((unsigned char)c);
+                for(auto& c : ext) c = (char)tolower((unsigned char)c);
                 isLhtml = (ext == "lhtml");
             }
         }
 
-        if (isLhtml) {
-            // Compile the .lhtml template into a Lua chunk string, then load it
+        if(isLhtml) {
             std::string src;
-            if (!readFile(ctx_ptr->scriptPath, src)) {
+            if(!readFile(ctx_ptr->scriptPath, src)) {
                 ctx_ptr->resp->statusCode = 500;
                 ctx_ptr->resp->body = "<h1>500 — Cannot read template</h1>";
                 ctx_ptr->resp->headers.set("content-length",
-                                            std::to_string(ctx_ptr->resp->body.size()));
+                                           std::to_string(ctx_ptr->resp->body.size()));
                 ctx_ptr->handled = true;
                 pthread_setspecific(gCtxKey, nullptr);
                 return 1;
             }
             std::string chunk = compileLhtml(src, ctx_ptr->scriptPath);
-            // Use "@filename" as chunk name so Lua error messages show the source path
             std::string chunkName = "@" + ctx_ptr->scriptPath;
             rc = luaL_loadbuffer(L, chunk.c_str(), chunk.size(), chunkName.c_str());
         } else {
-            // Plain .lua script — load directly from file
             rc = luaL_loadfile(L, ctx_ptr->scriptPath.c_str());
         }
 
-        // Cache only a chunk that loaded cleanly, so a syntax error is retried
-        // (and re-reported) on the next request rather than being memoised.
         if(rc == LUA_OK && haveStat)
             storeChunk(L, ctx_ptr->scriptPath, st);
     }
 
     if(rc != LUA_OK) {
         const char* err = lua_tostring(L, -1);
-        fprintf(stderr, "[LUA] Load error %s: %s\n",
-                ctx_ptr->scriptPath.c_str(), err ? err : "?");
+        fprintf(stderr, "[LUA] Load error %s: %s\n", ctx_ptr->scriptPath.c_str(), err ? err : "?");
         ctx_ptr->resp->statusCode = 500;
         ctx_ptr->resp->body  = "<h1>500 — Lua Load Error</h1><pre>";
         ctx_ptr->resp->body += (err ? err : "unknown error");
         ctx_ptr->resp->body += "</pre>";
-        ctx_ptr->resp->headers.set("content-length",
-                                   std::to_string(ctx_ptr->resp->body.size()));
+        ctx_ptr->resp->headers.set("content-length", std::to_string(ctx_ptr->resp->body.size()));
         lua_pop(L, 1);
         ctx_ptr->handled = true;
         pthread_setspecific(gCtxKey, nullptr);
@@ -783,25 +806,21 @@ HTTPD_EXPORT int httpd_module_handle(httpd::RequestCtx* ctx_ptr) {
     rc = lua_pcall(L, 0, 0, 0);
     if(rc != LUA_OK) {
         const char* err = lua_tostring(L, -1);
-        fprintf(stderr, "[LUA] Runtime error %s: %s\n",
-                ctx_ptr->scriptPath.c_str(), err ? err : "?");
+        fprintf(stderr, "[LUA] Runtime error %s: %s\n", ctx_ptr->scriptPath.c_str(), err ? err : "?");
         ctx_ptr->resp->statusCode = 500;
         ctx_ptr->resp->body  = "<h1>500 — Lua Runtime Error</h1><pre>";
         ctx_ptr->resp->body += (err ? err : "unknown error");
         ctx_ptr->resp->body += "</pre>";
-        ctx_ptr->resp->headers.set("content-length",
-                                   std::to_string(ctx_ptr->resp->body.size()));
+        ctx_ptr->resp->headers.set("content-length", std::to_string(ctx_ptr->resp->body.size()));
         lua_pop(L, 1);
         ctx_ptr->handled = true;
         pthread_setspecific(gCtxKey, nullptr);
         return 1;
     }
 
-    // Commit output produced by httpd.write()
     if(!lrc.output.empty()) {
         ctx_ptr->resp->body = std::move(lrc.output);
-        ctx_ptr->resp->headers.set("content-length",
-                                   std::to_string(ctx_ptr->resp->body.size()));
+        ctx_ptr->resp->headers.set("content-length", std::to_string(ctx_ptr->resp->body.size()));
     }
     ctx_ptr->handled = true;
     pthread_setspecific(gCtxKey, nullptr);
