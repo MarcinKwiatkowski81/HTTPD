@@ -226,6 +226,11 @@ bool Http1Parser::finaliseHeaders() {
     if(Headers::eqi(conn,"keep-alive")) req_.keepAlive=true;
     if(Headers::eqi(conn,"close"))      req_.keepAlive=false;
 
+    // Parse cookies unconditionally — must happen regardless of whether the
+    // request carries a body (RFC 6265: Cookie header is valid on any method).
+    auto cookieHdr=req_.headers.get("cookie");
+    if(!cookieHdr.empty()) parseCookies(cookieHdr);
+
     // Chunked trumps Content-Length (RFC 9112 §6.3)
     if(!te.empty()&&te.find("chunked")!=std::string_view::npos) {
         req_.chunked=true;
@@ -241,13 +246,8 @@ bool Http1Parser::finaliseHeaders() {
         phase_=Phase::Body;
         return true;
     }
-    // No body for safe methods
+    // No body
     phase_=Phase::Done;
-
-    // Parse cookies
-    auto cookieHdr=req_.headers.get("cookie");
-    if(!cookieHdr.empty()) parseCookies(cookieHdr);
-
     return true;
 }
 
