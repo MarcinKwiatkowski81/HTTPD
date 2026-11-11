@@ -1,0 +1,320 @@
+<%
+-- dns/add_record.lhtml — formularz dodawania nowego rekordu DNS
+
+local ok_lib, lib = pcall(dofile, "/home/mkwiatkowski/Website/HTTPD/www/dns/lib.lua")
+local sid      = httpd.get_cookie("DNSSID")
+local username = sid and httpd.session_get(sid) or nil
+if not username then httpd.redirect("/dns/login.lua"); return end
+
+local zones, _ = lib.load_zones()
+local err, success = nil, nil
+local pre = {}   -- przechowuje wartości formularza przy błędzie
+
+local TYPES = {"A","AAAA","CNAME","MX","NS","PTR","TXT","SOA","SRV","CAA"}
+
+if httpd.method() == "POST" then
+    local p = httpd.parse_form(httpd.body())
+    pre = p
+
+    local zone_name = p.zone   or ""
+    local name      = p.name   or ""
+    local rtype     = p.rtype  or ""
+    local ttl       = tonumber(p.ttl) or 300
+    local value     = p.value  or ""
+
+    if zone_name == "" then err = "Wybierz strefę."
+    elseif rtype == "" then err = "Wybierz typ rekordu."
+    elseif value == "" and rtype ~= "SOA" then err = "Wartość nie może być pusta."
+    else
+        -- Zbuduj rdata
+        local rdata = {}
+        if rtype == "MX" then
+            rdata = { priority = tonumber(p.priority) or 10, value = value }
+        elseif rtype == "SOA" then
+            rdata = {
+                mname   = p.mname   or value,
+                rname   = p.rname   or "",
+                serial  = tonumber(p.serial)  or 2024010101,
+                refresh = tonumber(p.refresh) or 3600,
+                retry   = tonumber(p.retry)   or 900,
+                expire  = tonumber(p.expire)  or 604800,
+                minimum = tonumber(p.minimum) or 300,
+            }
+        elseif rtype == "SRV" then
+            rdata = {
+                priority = tonumber(p.priority) or 0,
+                weight   = tonumber(p.weight)   or 0,
+                port     = tonumber(p.port)     or 80,
+                value    = value,
+            }
+        elseif rtype == "CAA" then
+            rdata = {
+                flags = tonumber(p.flags) or 0,
+                tag   = p.tag or "issue",
+                value = value,
+            }
+        else
+            rdata = { value = value }
+        end
+
+        local cmd = {
+            op        = "add",
+            zone      = zone_name,
+            name      = name == "" and "" or name,
+            rtype     = rtype,
+            ttl       = ttl,
+            rdata     = rdata,
+        }
+        local ok, cmd_err = lib.send_cmd(cmd)
+        if ok then
+            httpd.redirect("/dns/records.lhtml?zone=" .. httpd.urlencode(zone_name) ..
+                           "&ok=" .. httpd.urlencode("Rekord dodany. Zmiany pojawią się po odświeżeniu serwera DNS."))
+            return
+        else
+            err = "Błąd zapisu polecenia: " .. (cmd_err or "?")
+        end
+    end
+end
+
+local presel_zone = httpd.get_param("zone") or pre.zone or ""
+%>
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Nowy rekord — Panel DNS</title>
+  <style>
+    :root { --bg:#0d1117; --surface:#161b22; --border:#30363d;
+            --text:#c9d1d9; --muted:#8b949e; --accent:#388bfd;
+            --green:#3fb950; --red:#f85149; }
+    *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+    body { font:14px/1.6 'Segoe UI',system-ui,sans-serif;
+           background:var(--bg); color:var(--text); min-height:100vh; }
+    .layout { display:grid; grid-template-columns:220px 1fr; min-height:100vh; }
+    .sidebar { background:var(--surface); border-right:1px solid var(--border);
+               padding:1.5rem 0; display:flex; flex-direction:column; }
+    .sidebar-brand { padding:0 1.25rem 1.5rem; font-size:1.1rem; font-weight:700;
+                     color:var(--accent); border-bottom:1px solid var(--border); margin-bottom:1rem; }
+    .sidebar-brand span { font-size:.75rem; color:var(--muted); display:block; font-weight:400; }
+    .nav-item { display:block; padding:.55rem 1.25rem; color:var(--muted);
+                text-decoration:none; font-size:.875rem;
+                border-left:3px solid transparent; }
+    .nav-item:hover  { color:var(--text); background:rgba(255,255,255,.04); }
+    .nav-item.active { color:var(--accent); border-left-color:var(--accent); }
+    .nav-sep { border:none; border-top:1px solid var(--border); margin:.75rem 0; }
+    .nav-user { margin-top:auto; padding:1rem 1.25rem;
+                border-top:1px solid var(--border); font-size:.8rem; color:var(--muted); }
+    .nav-user strong { color:var(--text); display:block; }
+
+    .main { padding:2rem; max-width:700px; }
+    h1 { font-size:1.3rem; margin-bottom:1.5rem; }
+
+    .alert-err { background:rgba(248,81,73,.1); border:1px solid rgba(248,81,73,.3);
+                 color:var(--red); border-radius:6px; padding:.65rem 1rem;
+                 margin-bottom:1.25rem; font-size:.875rem; }
+    .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    .form-full  { grid-column:1/-1; }
+    label { display:block; font-size:.78rem; color:var(--muted); margin-bottom:.3rem; }
+    input, select, textarea {
+      width:100%; padding:.55rem .7rem;
+      background:#0d1117; border:1px solid var(--border);
+      border-radius:6px; color:var(--text); font-size:.875rem;
+      outline:none; font-family:inherit; }
+    input:focus, select:focus, textarea:focus { border-color:var(--accent); }
+    textarea { resize:vertical; min-height:60px; }
+    .hint { font-size:.72rem; color:var(--muted); margin-top:.25rem; }
+
+    /* Dynamiczne pola wg typu */
+    .extra-fields { display:none; }
+    .extra-fields.show { display:contents; }
+
+    .actions { display:flex; gap:.75rem; margin-top:1.75rem; }
+    .btn { display:inline-flex; align-items:center; gap:.4rem;
+           padding:.55rem 1.1rem; border-radius:6px; font-size:.875rem;
+           font-weight:600; cursor:pointer; border:1px solid var(--border);
+           text-decoration:none; transition:background .15s; }
+    .btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .btn-primary:hover { background:#1f6feb; }
+    .btn-ghost { background:transparent; color:var(--text); }
+    .btn-ghost:hover { background:rgba(255,255,255,.06); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-brand">⬡ Panel DNS<span>SoftStudio</span></div>
+    <a class="nav-item" href="/dns/">Przegląd stref</a>
+    <a class="nav-item" href="/dns/records.lhtml">Wszystkie rekordy</a>
+    <hr class="nav-sep">
+    <a class="nav-item active" href="/dns/add_record.lhtml">+ Nowy rekord</a>
+    <a class="nav-item" href="/dns/add_zone.lhtml">+ Nowa strefa</a>
+    <hr class="nav-sep">
+    <a class="nav-item" href="/dns/peers.lhtml">Węzły P2P</a>
+    <div class="nav-user">
+      <strong><%= username %></strong>
+      <a href="/dns/logout.lua" style="color:var(--red);text-decoration:none">Wyloguj</a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <h1>Nowy rekord DNS</h1>
+<%  if err then %><div class="alert-err">✗ <%= lib.h(err) %></div><% end %>
+
+    <form method="POST" action="/dns/add_record.lhtml">
+      <div class="form-grid">
+
+        <div>
+          <label for="f-zone">Strefa *</label>
+          <select id="f-zone" name="zone" required>
+            <option value="">— wybierz —</option>
+<%          for _, z in ipairs(zones) do %>
+            <option value="<%= lib.h(z.name) %>"<%= z.name == presel_zone and " selected" or "" %>><%= lib.h(z.name) %></option>
+<%          end %>
+          </select>
+        </div>
+
+        <div>
+          <label for="f-type">Typ rekordu *</label>
+          <select id="f-type" name="rtype" required onchange="switchType(this.value)">
+            <option value="">— wybierz —</option>
+<%          for _, t in ipairs(TYPES) do %>
+            <option value="<%= t %>"<%= pre.rtype == t and " selected" or "" %>><%= t %></option>
+<%          end %>
+          </select>
+        </div>
+
+        <div>
+          <label for="f-name">Nazwa (pusta = apex @)</label>
+          <input id="f-name" type="text" name="name" placeholder="np. mail lub www"
+                 value="<%= lib.h(pre.name or '') %>">
+          <p class="hint">Etykieta względna. Puste = rekord strefy (@).</p>
+        </div>
+
+        <div>
+          <label for="f-ttl">TTL (s)</label>
+          <input id="f-ttl" type="number" name="ttl" min="30" max="2592000"
+                 value="<%= lib.h(pre.ttl or '3600') %>">
+        </div>
+
+        <%-- Pola wspólne — wartość --%>
+        <div class="form-full" id="field-value">
+          <label for="f-value">Wartość *</label>
+          <input id="f-value" type="text" name="value"
+                 value="<%= lib.h(pre.value or '') %>"
+                 placeholder="np. 192.168.1.10">
+        </div>
+
+        <%-- MX / SRV — priorytet --%>
+        <div class="extra-fields" id="ex-priority">
+          <label for="f-priority">Priorytet</label>
+          <input id="f-priority" type="number" name="priority" min="0" max="65535"
+                 value="<%= lib.h(pre.priority or '10') %>">
+        </div>
+
+        <%-- SRV — weight / port --%>
+        <div class="extra-fields" id="ex-weight">
+          <label for="f-weight">Weight</label>
+          <input id="f-weight" type="number" name="weight" value="<%= lib.h(pre.weight or '0') %>">
+        </div>
+        <div class="extra-fields" id="ex-port">
+          <label for="f-port">Port *</label>
+          <input id="f-port" type="number" name="port" min="1" max="65535"
+                 value="<%= lib.h(pre.port or '80') %>">
+        </div>
+
+        <%-- CAA — flags / tag --%>
+        <div class="extra-fields" id="ex-flags">
+          <label for="f-flags">Flags</label>
+          <input id="f-flags" type="number" name="flags" min="0" max="255"
+                 value="<%= lib.h(pre.flags or '0') %>">
+        </div>
+        <div class="extra-fields" id="ex-tag">
+          <label for="f-tag">Tag</label>
+          <select id="f-tag" name="tag">
+            <option value="issue"<%= pre.tag=="issue" and " selected" or "" %>>issue</option>
+            <option value="issuewild"<%= pre.tag=="issuewild" and " selected" or "" %>>issuewild</option>
+            <option value="iodef"<%= pre.tag=="iodef" and " selected" or "" %>>iodef</option>
+          </select>
+        </div>
+
+        <%-- SOA — dodatkowe pola --%>
+        <div class="extra-fields form-full" id="ex-soa">
+          <div class="form-grid">
+            <div>
+              <label>MNAME (Primary NS)</label>
+              <input type="text" name="mname" value="<%= lib.h(pre.mname or '') %>"
+                     placeholder="ns1.internal.lan">
+            </div>
+            <div>
+              <label>RNAME (Email administratora)</label>
+              <input type="text" name="rname" value="<%= lib.h(pre.rname or '') %>"
+                     placeholder="admin.internal.lan">
+            </div>
+            <div>
+              <label>Serial</label>
+              <input type="number" name="serial" value="<%= lib.h(pre.serial or '2024010101') %>">
+            </div>
+            <div>
+              <label>Refresh (s)</label>
+              <input type="number" name="refresh" value="<%= lib.h(pre.refresh or '3600') %>">
+            </div>
+            <div>
+              <label>Retry (s)</label>
+              <input type="number" name="retry" value="<%= lib.h(pre.retry or '900') %>">
+            </div>
+            <div>
+              <label>Expire (s)</label>
+              <input type="number" name="expire" value="<%= lib.h(pre.expire or '604800') %>">
+            </div>
+            <div>
+              <label>Minimum TTL (s)</label>
+              <input type="number" name="minimum" value="<%= lib.h(pre.minimum or '300') %>">
+            </div>
+          </div>
+        </div>
+
+      </div><%-- /form-grid --%>
+
+      <div class="actions">
+        <button class="btn btn-primary" type="submit">Dodaj rekord</button>
+        <a class="btn btn-ghost" href="/dns/records.lhtml<%= presel_zone ~= '' and ('?zone='..httpd.urlencode(presel_zone)) or '' %>">Anuluj</a>
+      </div>
+    </form>
+  </main>
+</div>
+<script>
+var typeConfig = {
+    A:     { value:"Adres IPv4",        extras:[] },
+    AAAA:  { value:"Adres IPv6",        extras:[] },
+    CNAME: { value:"Cel (FQDN)",        extras:[] },
+    NS:    { value:"Serwer nazw (FQDN)",extras:[] },
+    PTR:   { value:"Cel (FQDN)",        extras:[] },
+    TXT:   { value:"Treść TXT",         extras:[] },
+    MX:    { value:"Serwer pocztowy",   extras:["priority"] },
+    SRV:   { value:"Cel (FQDN)",        extras:["priority","weight","port"] },
+    CAA:   { value:"Wartość (np. letsencrypt.org)", extras:["flags","tag"] },
+    SOA:   { value:null,                extras:["soa"] },
+};
+function switchType(t) {
+    var cfg = typeConfig[t] || { value:"Wartość", extras:[] };
+    // wartość
+    var fv = document.getElementById("field-value");
+    if (cfg.value) {
+        fv.style.display = "";
+        fv.querySelector("label").textContent = cfg.value + " *";
+    } else {
+        fv.style.display = "none";
+    }
+    // extra fields
+    ["priority","weight","port","flags","tag","soa"].forEach(function(id) {
+        var el = document.getElementById("ex-" + id);
+        if (el) el.classList.toggle("show", cfg.extras.indexOf(id) >= 0);
+    });
+}
+// Inicjalizacja przy załadowaniu (przy błędzie formularza)
+var t0 = document.getElementById("f-type").value;
+if (t0) switchType(t0);
+</script>
+</body>
+</html>

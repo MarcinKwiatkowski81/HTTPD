@@ -1,0 +1,168 @@
+<%
+-- dns/log.lhtml — podgląd kolejki poleceń (dns_cmd.jsonl) i ostatnich wpisów logu
+local ok_lib, lib = pcall(dofile, "/home/mkwiatkowski/Website/HTTPD/www/dns/lib.lua")
+local sid      = httpd.get_cookie("DNSSID")
+local username = sid and httpd.session_get(sid) or nil
+if not username then httpd.redirect("/dns/login.lua"); return end
+
+-- Ostatnie N linii pliku poleceń
+local CMD_FILE = lib.CMD_FILE
+local LOG_FILE = os.getenv("DNS_LOG")  or "/var/log/mydns.log"
+local MAX_LINES = 100
+
+local function tail(path, n)
+    local lines = {}
+    local f = io.open(path, "r")
+    if not f then return nil, "Nie można otworzyć: " .. path end
+    for line in f:lines() do
+        table.insert(lines, line)
+        if #lines > n * 2 then
+            table.remove(lines, 1)
+        end
+    end
+    f:close()
+    -- zwróć ostatnie n
+    local result = {}
+    local start = math.max(1, #lines - n + 1)
+    for i = start, #lines do
+        table.insert(result, lines[i])
+    end
+    return result
+end
+
+local cmd_lines, cmd_err  = tail(CMD_FILE, MAX_LINES)
+local log_lines, log_err  = tail(LOG_FILE, MAX_LINES)
+%>
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Dziennik — Panel DNS</title>
+  <style>
+    :root { --bg:#0d1117; --surface:#161b22; --border:#30363d;
+            --text:#c9d1d9; --muted:#8b949e; --accent:#388bfd;
+            --green:#3fb950; --red:#f85149; --yellow:#d29922; }
+    *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+    body { font:13px/1.6 'Segoe UI',system-ui,sans-serif;
+           background:var(--bg); color:var(--text); min-height:100vh; }
+    .layout { display:grid; grid-template-columns:220px 1fr; min-height:100vh; }
+    .sidebar { background:var(--surface); border-right:1px solid var(--border);
+               padding:1.5rem 0; display:flex; flex-direction:column; }
+    .sidebar-brand { padding:0 1.25rem 1.5rem; font-size:1.1rem; font-weight:700;
+                     color:var(--accent); border-bottom:1px solid var(--border); margin-bottom:1rem; }
+    .sidebar-brand span { font-size:.75rem; color:var(--muted); display:block; font-weight:400; }
+    .nav-item { display:block; padding:.55rem 1.25rem; color:var(--muted);
+                text-decoration:none; font-size:.875rem; border-left:3px solid transparent; }
+    .nav-item:hover  { color:var(--text); background:rgba(255,255,255,.04); }
+    .nav-item.active { color:var(--accent); border-left-color:var(--accent); }
+    .nav-sep { border:none; border-top:1px solid var(--border); margin:.75rem 0; }
+    .nav-user { margin-top:auto; padding:1rem 1.25rem;
+                border-top:1px solid var(--border); font-size:.8rem; color:var(--muted); }
+    .nav-user strong { color:var(--text); display:block; }
+    .main { padding:2rem; display:flex; flex-direction:column; gap:2rem; }
+    h1 { font-size:1.3rem; }
+    h2 { font-size:.95rem; font-weight:600; color:var(--muted);
+         text-transform:uppercase; letter-spacing:.05em; margin-bottom:.75rem; }
+    .log-box { background:var(--surface); border:1px solid var(--border);
+               border-radius:8px; overflow:hidden; }
+    .log-header { padding:.65rem 1rem; border-bottom:1px solid var(--border);
+                  display:flex; align-items:center; justify-content:space-between; }
+    .log-title { font-size:.8rem; font-weight:600; color:var(--muted); }
+    .log-path  { font-size:.72rem; color:var(--muted); font-family:monospace; }
+    pre { padding:1rem; overflow-x:auto; font-size:.75rem; line-height:1.5;
+          max-height:400px; overflow-y:auto; margin:0;
+          font-family:'Cascadia Code','Fira Code',monospace; }
+    .err-msg { padding:1rem; color:var(--red); font-size:.85rem; }
+
+    /* Kolorowanie linii logu */
+    .l-err  { color:var(--red); }
+    .l-warn { color:var(--yellow); }
+    .l-info { color:var(--text); }
+    .l-dbg  { color:var(--muted); }
+    .l-add  { color:var(--green); }
+    .l-del  { color:var(--red); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-brand">⬡ Panel DNS<span>SoftStudio</span></div>
+    <a class="nav-item" href="/dns/">Przegląd stref</a>
+    <a class="nav-item" href="/dns/records.lhtml">Wszystkie rekordy</a>
+    <hr class="nav-sep">
+    <a class="nav-item" href="/dns/add_zone.lhtml">+ Nowa strefa</a>
+    <a class="nav-item" href="/dns/add_record.lhtml">+ Nowy rekord</a>
+    <hr class="nav-sep">
+    <a class="nav-item" href="/dns/peers.lhtml">Węzły P2P</a>
+    <a class="nav-item active" href="/dns/log.lhtml">Dziennik</a>
+    <div class="nav-user">
+      <strong><%= username %></strong>
+      <a href="/dns/logout.lua" style="color:var(--red);text-decoration:none">Wyloguj</a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <h1>Dziennik</h1>
+
+    <%-- Kolejka poleceń --%>
+    <div class="log-box">
+      <div class="log-header">
+        <span class="log-title">Kolejka poleceń panelu → serwer DNS</span>
+        <span class="log-path"><%= lib.h(CMD_FILE) %></span>
+      </div>
+<%    if cmd_err then %>
+      <div class="err-msg">✗ <%= lib.h(cmd_err) %></div>
+<%    elseif not cmd_lines or #cmd_lines == 0 then %>
+      <div class="err-msg" style="color:var(--muted)">Kolejka jest pusta.</div>
+<%    else %>
+      <pre id="cmd-pre"><%
+        for _, line in ipairs(cmd_lines) do
+            local cls = "l-info"
+            if line:find('"op":"add"') or line:find('"op":"add_zone"') then
+                cls = "l-add"
+            elseif line:find('"op":"delete"') then
+                cls = "l-del"
+            end
+            httpd.write('<span class="' .. cls .. '">' ..
+                        httpd.escape_html(line) .. '</span>\n')
+        end
+%></pre>
+<%    end %>
+    </div>
+
+    <%-- Log serwera DNS --%>
+    <div class="log-box">
+      <div class="log-header">
+        <span class="log-title">Log serwera DNS</span>
+        <span class="log-path"><%= lib.h(LOG_FILE) %></span>
+      </div>
+<%    if log_err then %>
+      <div class="err-msg">✗ <%= lib.h(log_err) %></div>
+<%    elseif not log_lines or #log_lines == 0 then %>
+      <div class="err-msg" style="color:var(--muted)">Log jest pusty lub nie istnieje.</div>
+<%    else %>
+      <pre id="log-pre"><%
+        for _, line in ipairs(log_lines) do
+            local cls = "l-info"
+            if line:find("ERROR")   then cls = "l-err"
+            elseif line:find("WARNING") then cls = "l-warn"
+            elseif line:find("DEBUG")   then cls = "l-dbg"
+            end
+            httpd.write('<span class="' .. cls .. '">' ..
+                        httpd.escape_html(line) .. '</span>\n')
+        end
+%></pre>
+<%    end %>
+    </div>
+  </main>
+</div>
+<script>
+// Auto-scroll do dołu obu pre
+["cmd-pre","log-pre"].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) el.scrollTop = el.scrollHeight;
+});
+</script>
+</body>
+</html>

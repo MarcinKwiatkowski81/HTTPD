@@ -1,0 +1,216 @@
+<%
+-- ── Panel DNS — strona główna ─────────────────────────────────────────────────
+-- Wymaga zalogowania (cookie DNSSID).
+-- Wyświetla listę stref i liczbę rekordów w każdej.
+
+local base = httpd.path():match("^(.*/)") or "/dns/"
+local lib  = dofile("/dev/stdin")  -- zastąpione poniżej przez dofile ścieżki
+
+-- Bezpośredni require nie działa bez path; używamy loadfile względem docroot.
+-- Serwer ustawia zmienną środowiskową DOCUMENT_ROOT lub używamy stałej.
+local lib_path = base:gsub("^/", "") .. "lib.lua"
+-- Próbujemy załadować lib z katalogu skryptu
+local ok_lib, lib = pcall(dofile, lib_path)
+if not ok_lib then
+    -- Fallback: ścieżka bezwzględna
+    ok_lib, lib = pcall(dofile, "/home/mkwiatkowski/Website/HTTPD/www/dns/lib.lua")
+end
+
+-- ── Uwierzytelnienie ──────────────────────────────────────────────────────────
+local sid      = httpd.get_cookie("DNSSID")
+local username = sid and httpd.session_get(sid) or nil
+if not username then
+    httpd.redirect("/dns/login.lua")
+    return
+end
+
+-- ── Dane ──────────────────────────────────────────────────────────────────────
+local zones, err = lib.load_zones()
+
+-- Flash message z poprzedniego POST
+local flash_ok  = httpd.get_param("ok")
+local flash_err = httpd.get_param("err") or err
+%>
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Panel DNS</title>
+  <style>
+    :root {
+      --bg:      #0d1117;
+      --surface: #161b22;
+      --border:  #30363d;
+      --text:    #c9d1d9;
+      --muted:   #8b949e;
+      --accent:  #388bfd;
+      --green:   #3fb950;
+      --red:     #f85149;
+      --yellow:  #d29922;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font: 14px/1.6 'Segoe UI', system-ui, sans-serif;
+           background: var(--bg); color: var(--text); min-height: 100vh; }
+
+    /* ── Layout ── */
+    .layout { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+
+    /* ── Sidebar ── */
+    .sidebar { background: var(--surface); border-right: 1px solid var(--border);
+               padding: 1.5rem 0; display: flex; flex-direction: column; }
+    .sidebar-brand { padding: 0 1.25rem 1.5rem;
+                     font-size: 1.1rem; font-weight: 700; color: var(--accent);
+                     border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
+    .sidebar-brand span { font-size: .75rem; color: var(--muted);
+                          display: block; font-weight: 400; }
+    .nav-item { display: block; padding: .55rem 1.25rem;
+                color: var(--muted); text-decoration: none; font-size: .875rem;
+                border-left: 3px solid transparent;
+                transition: color .15s, border-color .15s, background .15s; }
+    .nav-item:hover  { color: var(--text); background: rgba(255,255,255,.04); }
+    .nav-item.active { color: var(--accent); border-left-color: var(--accent);
+                       background: rgba(56,139,253,.08); }
+    .nav-sep { border: none; border-top: 1px solid var(--border);
+               margin: .75rem 0; }
+    .nav-user { margin-top: auto; padding: 1rem 1.25rem;
+                border-top: 1px solid var(--border);
+                font-size: .8rem; color: var(--muted); }
+    .nav-user strong { color: var(--text); display: block; }
+
+    /* ── Main ── */
+    .main { padding: 2rem; overflow: auto; }
+    .page-header { display: flex; align-items: center;
+                   justify-content: space-between; margin-bottom: 1.75rem; }
+    .page-title  { font-size: 1.4rem; font-weight: 600; color: var(--text); }
+    .page-sub    { font-size: .8rem; color: var(--muted); margin-top: .15rem; }
+
+    /* ── Alerts ── */
+    .alert { padding: .75rem 1rem; border-radius: 6px; margin-bottom: 1.25rem;
+             font-size: .875rem; display: flex; align-items: center; gap: .6rem; }
+    .alert-ok  { background: rgba(63,185,80,.12); border: 1px solid rgba(63,185,80,.3);
+                 color: var(--green); }
+    .alert-err { background: rgba(248,81,73,.12); border: 1px solid rgba(248,81,73,.3);
+                 color: var(--red); }
+
+    /* ── Karty stref ── */
+    .zone-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr));
+                 gap: 1rem; }
+    .zone-card { background: var(--surface); border: 1px solid var(--border);
+                 border-radius: 8px; padding: 1.25rem 1.5rem;
+                 text-decoration: none; color: inherit;
+                 transition: border-color .15s, box-shadow .15s;
+                 display: flex; flex-direction: column; gap: .5rem; }
+    .zone-card:hover { border-color: var(--accent);
+                       box-shadow: 0 0 0 1px var(--accent); }
+    .zone-name { font-size: .95rem; font-weight: 600; color: var(--accent);
+                 font-family: monospace; }
+    .zone-meta { font-size: .78rem; color: var(--muted);
+                 display: flex; gap: 1rem; flex-wrap: wrap; }
+    .badge { display: inline-block; padding: .15rem .5rem; border-radius: 100px;
+             font-size: .7rem; font-weight: 700; }
+    .badge-blue   { background: rgba(56,139,253,.15); color: var(--accent); }
+    .badge-green  { background: rgba(63,185,80,.15);  color: var(--green); }
+    .badge-yellow { background: rgba(210,153,34,.15); color: var(--yellow); }
+
+    /* ── Przycisk ── */
+    .btn { display: inline-flex; align-items: center; gap: .4rem;
+           padding: .5rem 1rem; border-radius: 6px; font-size: .875rem;
+           font-weight: 600; cursor: pointer; text-decoration: none;
+           border: 1px solid var(--border); transition: background .15s; }
+    .btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .btn-primary:hover { background: #1f6feb; }
+    .btn-ghost   { background: transparent; color: var(--text); }
+    .btn-ghost:hover { background: rgba(255,255,255,.06); }
+
+    /* ── Pusta strefa ── */
+    .empty { text-align: center; padding: 4rem 2rem; color: var(--muted); }
+    .empty-icon { font-size: 3rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+<div class="layout">
+
+  <%-- Sidebar --%>
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      ⬡ Panel DNS
+      <span>SoftStudio</span>
+    </div>
+    <a class="nav-item active" href="/dns/">Przegląd stref</a>
+    <a class="nav-item" href="/dns/records.lhtml">Wszystkie rekordy</a>
+    <hr class="nav-sep">
+    <a class="nav-item" href="/dns/add_zone.lhtml">+ Nowa strefa</a>
+    <a class="nav-item" href="/dns/add_record.lhtml">+ Nowy rekord</a>
+    <hr class="nav-sep">
+    <a class="nav-item" href="/dns/peers.lhtml">Węzły P2P</a>
+    <a class="nav-item" href="/dns/log.lhtml">Dziennik</a>
+    <div class="nav-user">
+      <strong><%= username %></strong>
+      <a href="/dns/logout.lua" style="color:var(--red);text-decoration:none">Wyloguj</a>
+    </div>
+  </aside>
+
+  <%-- Treść główna --%>
+  <main class="main">
+    <div class="page-header">
+      <div>
+        <div class="page-title">Strefy DNS</div>
+        <div class="page-sub">Autorytywne strefy na tym węźle</div>
+      </div>
+      <a class="btn btn-primary" href="/dns/add_zone.lhtml">+ Nowa strefa</a>
+    </div>
+
+<%  if flash_ok then %>
+    <div class="alert alert-ok">✓ <%= flash_ok %></div>
+<%  end %>
+<%  if flash_err then %>
+    <div class="alert alert-err">✗ <%= flash_err %></div>
+<%  end %>
+
+<%  if #zones == 0 then %>
+    <div class="empty">
+      <div class="empty-icon">🌐</div>
+      <p>Brak skonfigurowanych stref.<br>
+         <a href="/dns/add_zone.lhtml" style="color:var(--accent)">Dodaj pierwszą strefę</a></p>
+    </div>
+<%  else %>
+    <div class="zone-grid">
+<%    for _, zone in ipairs(zones) do
+        -- Policz aktywne rekordy wg typu
+        local counts = {}
+        local total  = 0
+        for _, rec in ipairs(zone.records or {}) do
+            if rec.deleted ~= "true" and rec.deleted ~= true then
+                counts[rec.rtype or "?"] = (counts[rec.rtype or "?"] or 0) + 1
+                total = total + 1
+            end
+        end
+        local types_str = ""
+        for t, n in pairs(counts) do
+            types_str = types_str .. t .. ":" .. n .. "  "
+        end
+%>
+      <a class="zone-card" href="/dns/records.lhtml?zone=<%= httpd.urlencode(zone.name) %>">
+        <div class="zone-name"><%= lib.h(zone.name) %></div>
+        <div class="zone-meta">
+          <span class="badge badge-blue"><%= total %> rekordów</span>
+<%        if counts["SOA"] then %>
+          <span class="badge badge-green">SOA ✓</span>
+<%        else %>
+          <span class="badge badge-yellow">brak SOA!</span>
+<%        end %>
+        </div>
+        <div style="font-size:.75rem;color:var(--muted);font-family:monospace;
+                    margin-top:.25rem;white-space:nowrap;overflow:hidden;
+                    text-overflow:ellipsis">
+          <%= httpd.escape_html(types_str) %>
+        </div>
+      </a>
+<%    end %>
+    </div>
+<%  end %>
+  </main>
+</div>
+</body>
+</html>

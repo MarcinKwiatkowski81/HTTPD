@@ -1,0 +1,156 @@
+<%
+-- dns/add_zone.lhtml — formularz dodawania nowej strefy DNS
+local ok_lib, lib = pcall(dofile, "/home/mkwiatkowski/Website/HTTPD/www/dns/lib.lua")
+local sid      = httpd.get_cookie("DNSSID")
+local username = sid and httpd.session_get(sid) or nil
+if not username then httpd.redirect("/dns/login.lua"); return end
+
+local err, pre = nil, {}
+
+if httpd.method() == "POST" then
+    local p = httpd.parse_form(httpd.body())
+    pre = p
+    local name  = (p.name  or ""):gsub("%s+","")
+    local ns    = p.ns     or ""
+    local email = p.email  or ""
+    local ns_ip = p.ns_ip  or ""
+
+    if name == "" then
+        err = "Nazwa strefy nie może być pusta."
+    else
+        if name:sub(-1) ~= "." then name = name .. "." end
+        local cmd = {
+            op    = "add_zone",
+            zone  = name,
+            ns    = ns    ~= "" and ns    or nil,
+            email = email ~= "" and email or nil,
+            ns_ip = ns_ip ~= "" and ns_ip or nil,
+        }
+        local ok, cmd_err = lib.send_cmd(cmd)
+        if ok then
+            httpd.redirect("/dns/?ok=" ..
+                httpd.urlencode("Strefa " .. name .. " dodana."))
+            return
+        else
+            err = "Błąd: " .. (cmd_err or "?")
+        end
+    end
+end
+%>
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Nowa strefa — Panel DNS</title>
+  <style>
+    :root { --bg:#0d1117; --surface:#161b22; --border:#30363d;
+            --text:#c9d1d9; --muted:#8b949e; --accent:#388bfd; --red:#f85149; }
+    *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+    body { font:14px/1.6 'Segoe UI',system-ui,sans-serif;
+           background:var(--bg); color:var(--text); min-height:100vh; }
+    .layout { display:grid; grid-template-columns:220px 1fr; min-height:100vh; }
+    .sidebar { background:var(--surface); border-right:1px solid var(--border);
+               padding:1.5rem 0; display:flex; flex-direction:column; }
+    .sidebar-brand { padding:0 1.25rem 1.5rem; font-size:1.1rem; font-weight:700;
+                     color:var(--accent); border-bottom:1px solid var(--border); margin-bottom:1rem; }
+    .sidebar-brand span { font-size:.75rem; color:var(--muted); display:block; font-weight:400; }
+    .nav-item { display:block; padding:.55rem 1.25rem; color:var(--muted);
+                text-decoration:none; font-size:.875rem; border-left:3px solid transparent; }
+    .nav-item:hover  { color:var(--text); background:rgba(255,255,255,.04); }
+    .nav-item.active { color:var(--accent); border-left-color:var(--accent); }
+    .nav-sep { border:none; border-top:1px solid var(--border); margin:.75rem 0; }
+    .nav-user { margin-top:auto; padding:1rem 1.25rem;
+                border-top:1px solid var(--border); font-size:.8rem; color:var(--muted); }
+    .nav-user strong { color:var(--text); display:block; }
+    .main { padding:2rem; max-width:600px; }
+    h1 { font-size:1.3rem; margin-bottom:1.5rem; }
+    .alert-err { background:rgba(248,81,73,.1); border:1px solid rgba(248,81,73,.3);
+                 color:var(--red); border-radius:6px; padding:.65rem 1rem;
+                 margin-bottom:1.25rem; font-size:.875rem; }
+    .form-row { margin-bottom:1rem; }
+    label { display:block; font-size:.78rem; color:var(--muted); margin-bottom:.3rem; }
+    input { width:100%; padding:.55rem .7rem; background:#0d1117;
+            border:1px solid var(--border); border-radius:6px;
+            color:var(--text); font-size:.875rem; outline:none; }
+    input:focus { border-color:var(--accent); }
+    .hint { font-size:.72rem; color:var(--muted); margin-top:.25rem; }
+    .section-label { font-size:.72rem; font-weight:700; color:var(--muted);
+                     text-transform:uppercase; letter-spacing:.06em;
+                     margin:1.5rem 0 .75rem; padding-bottom:.4rem;
+                     border-bottom:1px solid var(--border); }
+    .actions { display:flex; gap:.75rem; margin-top:1.75rem; }
+    .btn { display:inline-flex; align-items:center; padding:.55rem 1.1rem;
+           border-radius:6px; font-size:.875rem; font-weight:600; cursor:pointer;
+           border:1px solid var(--border); text-decoration:none; }
+    .btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .btn-primary:hover { background:#1f6feb; }
+    .btn-ghost { background:transparent; color:var(--text); }
+    .btn-ghost:hover { background:rgba(255,255,255,.06); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-brand">⬡ Panel DNS<span>SoftStudio</span></div>
+    <a class="nav-item" href="/dns/">Przegląd stref</a>
+    <a class="nav-item" href="/dns/records.lhtml">Wszystkie rekordy</a>
+    <hr class="nav-sep">
+    <a class="nav-item active" href="/dns/add_zone.lhtml">+ Nowa strefa</a>
+    <a class="nav-item" href="/dns/add_record.lhtml">+ Nowy rekord</a>
+    <hr class="nav-sep">
+    <a class="nav-item" href="/dns/peers.lhtml">Węzły P2P</a>
+    <div class="nav-user">
+      <strong><%= username %></strong>
+      <a href="/dns/logout.lua" style="color:var(--red);text-decoration:none">Wyloguj</a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <h1>Nowa strefa DNS</h1>
+<%  if err then %><div class="alert-err">✗ <%= lib.h(err) %></div><% end %>
+
+    <form method="POST" action="/dns/add_zone.lhtml">
+
+      <div class="form-row">
+        <label for="f-name">Nazwa strefy *</label>
+        <input id="f-name" type="text" name="name" required
+               value="<%= lib.h(pre.name or '') %>"
+               placeholder="np. internal.lan lub 1.168.192.in-addr.arpa">
+        <p class="hint">Kropka na końcu zostanie dodana automatycznie.</p>
+      </div>
+
+      <div class="section-label">Początkowe rekordy SOA / NS (opcjonalne)</div>
+
+      <div class="form-row">
+        <label for="f-ns">Główny serwer nazw (MNAME)</label>
+        <input id="f-ns" type="text" name="ns"
+               value="<%= lib.h(pre.ns or '') %>"
+               placeholder="np. ns1.internal.lan">
+      </div>
+
+      <div class="form-row">
+        <label for="f-ns-ip">Adres IP serwera NS (rekord A)</label>
+        <input id="f-ns-ip" type="text" name="ns_ip"
+               value="<%= lib.h(pre.ns_ip or '') %>"
+               placeholder="np. 192.168.1.1">
+        <p class="hint">Opcjonalnie — dodaje rekord A dla serwera NS.</p>
+      </div>
+
+      <div class="form-row">
+        <label for="f-email">Email administratora (RNAME w SOA)</label>
+        <input id="f-email" type="text" name="email"
+               value="<%= lib.h(pre.email or '') %>"
+               placeholder="np. admin.internal.lan">
+        <p class="hint">Format DNS: kropka zamiast @.</p>
+      </div>
+
+      <div class="actions">
+        <button class="btn btn-primary" type="submit">Utwórz strefę</button>
+        <a class="btn btn-ghost" href="/dns/">Anuluj</a>
+      </div>
+    </form>
+  </main>
+</div>
+</body>
+</html>

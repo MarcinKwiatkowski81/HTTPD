@@ -836,7 +836,7 @@ void EventLoop::serveFile(Connection* c, RawRequest& req, RawResponse& resp,
     resp.headers.set("content-type",   mimeType);
     resp.headers.set("content-length", std::to_string(resp.body.size()));
     if(!resp.headers.has("cache-control"))
-        resp.headers.set("cache-control", "public, max-age=3600");
+        resp.headers.set("cache-control", "no-cache");
 }
 
 void EventLoop::serveDir(Connection* /*c*/, RawRequest& req,
@@ -1380,7 +1380,7 @@ void Server::dispatchRequest(Connection* c, RawRequest& req, RawResponse& resp) 
     resp.headers.set("last-modified", httpDate(st.st_mtime));
     resp.headers.set("accept-ranges", "bytes");
     if(!resp.headers.has("cache-control"))
-        resp.headers.set("cache-control","public, max-age=3600");
+        resp.headers.set("cache-control", "no-cache");
 }
 
 void Server::run() {

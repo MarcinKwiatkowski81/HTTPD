@@ -1,0 +1,119 @@
+<%
+-- dns/peers.lhtml — status węzłów P2P
+local ok_lib, lib = pcall(dofile, "/home/mkwiatkowski/Website/HTTPD/www/dns/lib.lua")
+local sid      = httpd.get_cookie("DNSSID")
+local username = sid and httpd.session_get(sid) or nil
+if not username then httpd.redirect("/dns/login.lua"); return end
+
+-- Odczytaj listę peerów z osobnego pliku statusu
+local STATUS_FILE = os.getenv("DNS_STATUS") or "/tmp/dns_peers.json"
+local peer_data = "[]"
+local f = io.open(STATUS_FILE, "r")
+if f then peer_data = f:read("*a"); f:close() end
+
+-- Prosta detekcja czy plik JSON istnieje i nie jest pusty
+local has_status = (#peer_data > 2)
+%>
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Węzły P2P — Panel DNS</title>
+  <style>
+    :root { --bg:#0d1117; --surface:#161b22; --border:#30363d;
+            --text:#c9d1d9; --muted:#8b949e; --accent:#388bfd;
+            --green:#3fb950; --red:#f85149; --yellow:#d29922; }
+    *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+    body { font:14px/1.6 'Segoe UI',system-ui,sans-serif;
+           background:var(--bg); color:var(--text); min-height:100vh; }
+    .layout { display:grid; grid-template-columns:220px 1fr; min-height:100vh; }
+    .sidebar { background:var(--surface); border-right:1px solid var(--border);
+               padding:1.5rem 0; display:flex; flex-direction:column; }
+    .sidebar-brand { padding:0 1.25rem 1.5rem; font-size:1.1rem; font-weight:700;
+                     color:var(--accent); border-bottom:1px solid var(--border); margin-bottom:1rem; }
+    .sidebar-brand span { font-size:.75rem; color:var(--muted); display:block; font-weight:400; }
+    .nav-item { display:block; padding:.55rem 1.25rem; color:var(--muted);
+                text-decoration:none; font-size:.875rem; border-left:3px solid transparent; }
+    .nav-item:hover { color:var(--text); background:rgba(255,255,255,.04); }
+    .nav-item.active { color:var(--accent); border-left-color:var(--accent); }
+    .nav-sep { border:none; border-top:1px solid var(--border); margin:.75rem 0; }
+    .nav-user { margin-top:auto; padding:1rem 1.25rem;
+                border-top:1px solid var(--border); font-size:.8rem; color:var(--muted); }
+    .nav-user strong { color:var(--text); display:block; }
+    .main { padding:2rem; }
+    h1 { font-size:1.3rem; margin-bottom:1.5rem; }
+
+    .peer-card { background:var(--surface); border:1px solid var(--border);
+                 border-radius:8px; padding:1.25rem 1.5rem; margin-bottom:1rem;
+                 display:flex; align-items:center; gap:1.25rem; }
+    .peer-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+    .dot-on  { background:var(--green); box-shadow:0 0 6px var(--green); }
+    .dot-off { background:var(--red); }
+    .dot-unk { background:var(--muted); }
+    .peer-info { flex:1; }
+    .peer-host { font-family:monospace; font-size:.9rem; color:var(--text); }
+    .peer-meta { font-size:.75rem; color:var(--muted); margin-top:.2rem; }
+
+    .notice { background:rgba(210,153,34,.1); border:1px solid rgba(210,153,34,.3);
+              color:var(--yellow); border-radius:8px; padding:1.25rem 1.5rem;
+              font-size:.875rem; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-brand">⬡ Panel DNS<span>SoftStudio</span></div>
+    <a class="nav-item" href="/dns/">Przegląd stref</a>
+    <a class="nav-item" href="/dns/records.lhtml">Wszystkie rekordy</a>
+    <hr class="nav-sep">
+    <a class="nav-item" href="/dns/add_zone.lhtml">+ Nowa strefa</a>
+    <a class="nav-item" href="/dns/add_record.lhtml">+ Nowy rekord</a>
+    <hr class="nav-sep">
+    <a class="nav-item active" href="/dns/peers.lhtml">Węzły P2P</a>
+    <a class="nav-item" href="/dns/log.lhtml">Dziennik</a>
+    <div class="nav-user">
+      <strong><%= username %></strong>
+      <a href="/dns/logout.lua" style="color:var(--red);text-decoration:none">Wyloguj</a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <h1>Węzły P2P</h1>
+
+<%  if not has_status then %>
+    <div class="notice">
+      <strong>Brak danych o peerach.</strong><br>
+      Serwer DNS nie zapisał jeszcze pliku statusu (<code><%= lib.h(STATUS_FILE) %></code>).<br>
+      Upewnij się, że serwer DNS działa i skonfiguruj zmienną <code>DNS_STATUS</code>
+      wskazującą na właściwy plik.
+    </div>
+<%  else %>
+    <%-- Dane odczytane z pliku JSON — renderujemy przez JavaScript --%>
+    <div id="peers-container">Ładowanie…</div>
+    <script>
+    var data = <%! peer_data %>;
+    var html = "";
+    if (!Array.isArray(data) || data.length === 0) {
+        html = '<p style="color:var(--muted)">Brak skonfigurowanych peerów.</p>';
+    } else {
+        data.forEach(function(p) {
+            var dot = p.connected ? "dot-on" : (p.last_seen ? "dot-off" : "dot-unk");
+            var status = p.connected ? "Połączony" : (p.last_seen ? "Rozłączony" : "Nieznany");
+            html += '<div class="peer-card">' +
+                    '<div class="peer-dot ' + dot + '"></div>' +
+                    '<div class="peer-info">' +
+                    '<div class="peer-host">' + p.host + ':' + (p.port||5353) + '</div>' +
+                    '<div class="peer-meta">Status: ' + status +
+                    (p.last_seen ? ' · Ostatnie połączenie: ' + new Date(p.last_seen*1000).toLocaleString() : '') +
+                    (p.zones ? ' · Strefy: ' + p.zones.join(', ') : '') +
+                    '</div></div></div>';
+        });
+    }
+    document.getElementById("peers-container").innerHTML = html;
+    </script>
+<%  end %>
+  </main>
+</div>
+</body>
+</html>
