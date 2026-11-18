@@ -1,0 +1,157 @@
+# httpd.yaml — przykładowa konfiguracja serwera httpd
+# Uruchomienie: httpd -f /etc/httpd/httpd.yaml
+# Pola pominięte używają wartości domyślnych podanych w komentarzach.
+
+# ── Sieć ─────────────────────────────────────────────────────────────────────
+bind:          "0.0.0.0"   # adres nasłuchu
+port:          8080         # port HTTP (domyślnie 8080)
+https_port:    8443         # port HTTPS (domyślnie 8443)
+enable_http:   true
+enable_https:  false        # włącza się automatycznie gdy cert_file/key_file są ustawione
+
+# ── Certyfikat TLS (globalny / domyślny) ──────────────────────────────────────
+# cert_file: /etc/httpd/cert.pem
+# key_file:  /etc/httpd/key.pem
+# ca_file:   /etc/httpd/ca.pem
+ktls:  true     # kernel TLS offload (bezpieczne gdy niedostępny — fallback do user-space)
+http2: true     # HTTP/2 przez TLS ALPN
+
+# ── Procesy i wątki ───────────────────────────────────────────────────────────
+workers: 0      # 0 = auto (liczba CPU); użyj 1 jeśli masz stanowe sesje Lua
+threads: 4      # wątki I/O per worker
+
+# ── Domyślny katalog dokumentów (używany gdy żaden vhost nie pasuje) ───────────
+root:        "./www"
+index_files: "index.lhtml index.html index.htm index.lua"
+
+# ── CGI ───────────────────────────────────────────────────────────────────────
+cgi_dir: "/cgi-bin"
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+cache_max_entries:    1024
+cache_max_mb:         64
+stream_threshold_kb:  1024   # pliki powyżej tego progu są streamowane przez sendfile()
+
+# ── Logowanie ─────────────────────────────────────────────────────────────────
+access_log:       true
+# access_log_file: /var/log/httpd/access.log   # puste = stdout
+
+# ── Timeouty i limity ─────────────────────────────────────────────────────────
+keepalive_timeout: 60
+request_timeout:   30
+max_conns:         10000
+max_body_mb:       64
+
+# ── SPA fallback (globalnie) ──────────────────────────────────────────────────
+# spa_fallback:   false
+# spa_index:      index.html
+# spa_api_prefix: /api
+
+# ── Globalne przepisywanie URL ────────────────────────────────────────────────
+# Reguły są stosowane w kolejności do WSZYSTKICH żądań, zanim nastąpi routing.
+# pattern:     wyrażenie regularne (ECMAScript) dopasowywane do ścieżki
+# replacement: nowa ścieżka; $1..$9 = grupy przechwycenia
+# flag:        none | last | redirect | forbidden
+# redirect_code: kod HTTP dla flag: redirect (domyślnie 302)
+# if_header:   opcjonalnie — stosuj regułę tylko gdy nagłówek istnieje
+# if_value:    opcjonalnie — i jego wartość pasuje do tego wzorca
+
+rewrites:
+  # Przekierowanie HTTP → HTTPS (używane gdy serwer jest za load balancerem)
+  # - pattern:      "^/(.*)$"
+  #   replacement:  "https://example.com/$1"
+  #   flag:         redirect
+  #   redirect_code: 301
+  #   if_header:    "X-Forwarded-Proto"
+  #   if_value:     "http"
+
+  # Usuń .html z URL-i
+  - pattern:     "^/(.*)\\.html$"
+    replacement: "/$1"
+    flag:        last
+
+  # /old-path → /new-path
+  # - pattern:     "^/old-section(/.*)?$"
+  #   replacement: "/new-section$1"
+  #   flag:        redirect
+  #   redirect_code: 301
+
+# ── Globalne reguły reverse proxy ─────────────────────────────────────────────
+# location:          prefiks ścieżki (dopasowanie najdłuższego prefiksu)
+# target:            upstream URL (http:// lub https://)
+# strip_prefix:      usuń ten prefiks z ścieżki przed przekazaniem (domyślnie = location)
+# preserve_host:     przekaż oryginalny nagłówek Host (domyślnie false)
+# connect_timeout_ms: timeout połączenia z upstream (domyślnie 5000)
+# read_timeout_ms:   timeout odczytu odpowiedzi (domyślnie 30000)
+# add_headers:       nagłówki dodawane do żądania upstream
+# hide_headers:      nagłówki usuwane z odpowiedzi upstream
+
+proxies:
+  # Przekaż /api/ do mikroserwisu Node.js
+  # - location: "/api/"
+  #   target:   "http://127.0.0.1:3000"
+  #   add_headers:
+  #     - "X-Real-IP: forwarded"
+  #     - "X-Forwarded-Proto: https"
+  #   hide_headers:
+  #     - "X-Internal-Token"
+
+# ── Wirtualne hosty ───────────────────────────────────────────────────────────
+# Kolejność ma znaczenie — wygrywa pierwszy pasujący vhost.
+# Dopasowanie: dokładne → wildcard → catch-all (bez server_names).
+
+virtual_hosts:
+
+  # Przykład 1: strona główna
+  - name: "main-site"
+    server_names:
+      - "example.com"
+      - "www.example.com"
+    root: "/var/www/example.com"
+    index_files: "index.lhtml index.html"
+    cache_control: "public, max-age=3600"
+    add_headers:
+      - "Strict-Transport-Security: max-age=31536000; includeSubDomains"
+      - "X-Frame-Options: DENY"
+
+    rewrites:
+      # Wymuszaj trailing slash na katalogach
+      - pattern:     "^(/[^.]+[^/])$"
+        replacement: "$1/"
+        flag:        redirect
+        redirect_code: 301
+
+      # Wewnętrzne przepisanie dla SPA — /app/* → /app/index.html
+      - pattern:     "^/app/[^.]+$"
+        replacement: "/app/index.html"
+        flag:        last
+
+    proxies:
+      - location: "/api/"
+        target:   "http://127.0.0.1:3000"
+        preserve_host: false
+        connect_timeout_ms: 3000
+        read_timeout_ms:    15000
+        add_headers:
+          - "X-Real-IP: client"
+        hide_headers:
+          - "X-Powered-By"
+
+  # Przykład 2: API backend z własnym certyfikatem TLS (SNI)
+  # - name: "api-backend"
+  #   server_names:
+  #     - "api.example.com"
+  #   cert_file: "/etc/httpd/api.example.com.pem"
+  #   key_file:  "/etc/httpd/api.example.com.key"
+  #   root: "/var/www/api"
+  #   proxies:
+  #     - location: "/"
+  #       target:   "http://127.0.0.1:4000"
+
+  # Przykład 3: catch-all / domyślny vhost
+  # - name: "default"
+  #   root: "/var/www/default"
+
+# ── Dodatkowe moduły .so ──────────────────────────────────────────────────────
+# modules:
+#   - "/usr/lib/httpd/modules/my_module.so"

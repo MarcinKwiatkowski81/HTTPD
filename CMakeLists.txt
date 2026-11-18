@@ -46,6 +46,10 @@ set(CORE_SOURCES
     src/Cgi.cpp
     src/TlsContext.cpp
     src/EventLoop.cpp
+    src/Config.cpp
+    src/VHost.cpp
+    src/Rewrite.cpp
+    src/Proxy.cpp
 )
 add_library(httpd_core STATIC ${CORE_SOURCES})
 target_compile_options(httpd_core PRIVATE -fvisibility=hidden)
@@ -94,6 +98,40 @@ install(TARGETS httpd RUNTIME DESTINATION bin)
 if(HAVE_LUA)
     install(TARGETS lua_module LIBRARY DESTINATION lib/httpd/modules)
 endif()
+install(FILES conf/httpd.yaml DESTINATION etc/httpd RENAME httpd.yaml)
+install(DIRECTORY www/ DESTINATION share/httpd/www)
+install(FILES debian/httpd.service
+        DESTINATION lib/systemd/system
+        OPTIONAL)
+
+# ── Debian package (CPack) ────────────────────────────────────────────────────
+set(CPACK_GENERATOR "DEB")
+set(CPACK_PACKAGE_NAME        "httpd")
+set(CPACK_PACKAGE_VERSION     "1.0.0")
+set(CPACK_PACKAGE_RELEASE     "1")
+set(CPACK_PACKAGE_CONTACT     "Marcin Kwiatkowski <marcin@example.com>")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "httpd — C++17 HTTP/1.1+2 application server with Lua, CGI, vhosts, rewrite and reverse proxy")
+set(CPACK_PACKAGE_DESCRIPTION
+    "From-scratch C++17 HTTP server implementing RFC 9112/9113/9111/9110.\n"
+    "Features: HTTP/1.1, HTTP/2+HPACK, TLS 1.2/1.3 with ALPN, KTLS,\n"
+    "RFC 9111 response cache, FileCache, sendfile() streaming,\n"
+    "Range/multipart, CGI/1.1, Lua 5.4 scripting (.lua/.lhtml),\n"
+    "virtual hosts, URL rewrite engine, reverse proxy, YAML config.")
+set(CPACK_DEBIAN_PACKAGE_SECTION       "httpd")
+set(CPACK_DEBIAN_PACKAGE_PRIORITY      "optional")
+set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE  "amd64")
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "libssl3 (>= 3.0), zlib1g (>= 1.2), liblua5.4-0, libpthread-stubs0-dev")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS    "lua5.4, lua-socket, lua-sql-sqlite3")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER    "${CPACK_PACKAGE_CONTACT}")
+set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
+    "${CMAKE_SOURCE_DIR}/debian/conffiles"
+    "${CMAKE_SOURCE_DIR}/debian/postinst"
+    "${CMAKE_SOURCE_DIR}/debian/prerm")
+set(CPACK_DEBIAN_FILE_NAME             DEB-DEFAULT)
+set(CPACK_STRIP_FILES                  TRUE)
+include(CPack)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 message(STATUS "")

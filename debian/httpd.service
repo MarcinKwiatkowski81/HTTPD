@@ -1,0 +1,30 @@
+[Unit]
+Description=httpd — C++17 HTTP/1.1+HTTP/2 application server
+Documentation=https://github.com/MarcinKwiatkowski81/httpd
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=httpd
+Group=httpd
+ExecStart=/usr/bin/httpd -f /etc/httpd/httpd.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/log/httpd /var/www/httpd
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=httpd
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,10 @@
 #include "FileCache.h"
 #include "Module.h"
 #include "Cgi.h"
+#include "Config.h"
+#include "VHost.h"
+#include "Rewrite.h"
+#include "Proxy.h"
 #include "common.h"
 #include <functional>
 #include <memory>
@@ -37,6 +41,13 @@ struct ServerConfig {
     std::vector<ModuleEntry> modules;
     HttpCache::Config cache;
     bool accessLog=true; std::string accessLogFile; bool errorLog=true;
+    // SPA fallback
+    bool        spaFallback  = false;
+    std::string spaIndex     = "index.html";
+    std::string spaApiPrefix = "/api";
+    // YAML-driven extensions (virtual hosts, rewrite, proxy)
+    std::shared_ptr<YamlConfig>    yamlCfg;
+    std::shared_ptr<VHostSelector> vhostSelector;
 };
 enum class ConnState { TlsHandshake, ReadRequest, Processing, WriteResponse, KeepAlive, Http2, Closing };
 struct Connection {
@@ -105,8 +116,8 @@ private:
     void checkConditionals(const RawRequest& req, RawResponse& resp, time_t mtime, const std::string& etag, int64_t size);
     void addCommonHeaders(RawResponse& resp);
     void logAccess(Connection* c, const RawRequest& req, const RawResponse& resp);
-    // True when a cached response is backed by a file that has since changed.
     bool cachedEntryStale(const RawRequest& req, const CacheEntry& e) const;
+    bool trySpaFallback(const RawRequest& req, RawResponse& resp);
     static void* threadFn(void* arg); void startPool(int n);
     void sweepTimeouts(); int64_t nextSweepMs_=0;
 };
@@ -123,5 +134,12 @@ private:
     bool bindPorts(); void workerMain(int httpFd, int httpsFd);
     RequestHandler makeHandler();
     void dispatchRequest(Connection* c, RawRequest& req, RawResponse& resp);
+    // YAML pipeline helpers
+    std::unordered_map<std::string, RewriteEngine> rewriteEngines_;
+    ReverseProxy proxy_;
+    const ProxyPass* matchProxy(const std::vector<ProxyPass>& rules,
+                                const std::string& path) const;
+    bool runRewriteAndProxy(Connection* c, RawRequest& req, RawResponse& resp,
+                            const VirtualHost* vh);
 };
 } // namespace httpd

@@ -1063,9 +1063,99 @@ RequestHandler Server::makeHandler() {
     };
 }
 
+// ── Proxy location matcher ───────────────────────────────────────────────────
+const ProxyPass* Server::matchProxy(const std::vector<ProxyPass>& rules,
+                                     const std::string& path) const {
+    // Longest-prefix match
+    const ProxyPass* best = nullptr;
+    for(const auto& pp : rules) {
+        if(path.size() >= pp.location.size() &&
+           path.substr(0, pp.location.size()) == pp.location) {
+            if(!best || pp.location.size() > best->location.size())
+                best = &pp;
+        }
+    }
+    return best;
+}
+
+// ── Rewrite + proxy pipeline ──────────────────────────────────────────────────
+// Called from dispatchRequest before any file serving.
+// Returns true when it handled the request (proxy or redirect/forbidden rewrite).
+bool Server::runRewriteAndProxy(Connection* c, RawRequest& req, RawResponse& resp,
+                                 const VirtualHost* vh) {
+    if(!cfg_.yamlCfg) return false;
+
+    // 1. Rewrite: apply vhost rules first, then global rules
+    auto applyEngine = [&](const std::string& key) -> bool {
+        auto it = rewriteEngines_.find(key);
+        if(it == rewriteEngines_.end() || it->second.empty()) return false;
+        RewriteResult rr = it->second.apply(req);
+        switch(rr.action) {
+        case RewriteResult::Action::Forbidden:
+            resp.statusCode = 403;
+            resp.setBody("text/html; charset=utf-8", "<h1>403 Forbidden</h1>");
+            return true;
+        case RewriteResult::Action::Redirect: {
+            std::string loc = rr.newPath;
+            if(!rr.newQuery.empty()) loc += "?" + rr.newQuery;
+            resp.statusCode = rr.redirectCode;
+            resp.headers.set("location", loc);
+            resp.headers.set("content-length", "0");
+            return true;
+        }
+        default: return false;  // Rewritten/Last: path changed, continue dispatch
+        }
+    };
+
+    if(vh) { if(applyEngine(vh->name)) return true; }
+    if(applyEngine("__global__")) return true;
+
+    // 2. Proxy: check vhost rules first, then global
+    auto tryProxy = [&](const std::vector<ProxyPass>& rules) -> bool {
+        const ProxyPass* pp = matchProxy(rules, req.url.path);
+        if(!pp) return false;
+        std::string proxyErr;
+        proxy_.forward(*pp, req, resp, proxyErr);
+        if(!proxyErr.empty())
+            fprintf(stderr, "[PROXY] %s -> %s:%u: %s\n",
+                    req.url.path.c_str(),
+                    pp->targetHost.c_str(), pp->targetPort,
+                    proxyErr.c_str());
+        return true;
+    };
+
+    if(vh && tryProxy(vh->proxies))                     return true;
+    if(tryProxy(cfg_.yamlCfg->proxies))                 return true;
+    return false;
+}
+
 void Server::dispatchRequest(Connection* c, RawRequest& req, RawResponse& resp) {
     // Docroot-confined path + directory-index probe, shared with the cache
     // revalidation in EventLoop::cachedEntryStale.
+
+    // ── Virtual host selection ──────────────────────────────────────────────────
+    const VirtualHost* vh = nullptr;
+    if(cfg_.vhostSelector) {
+        vh = cfg_.vhostSelector->match(req.host());
+        if(vh) {
+            // Override docRoot and indexFiles from matched vhost
+            if(!vh->docRoot.empty())    cfg_.docRoot    = vh->docRoot;
+            if(!vh->indexFiles.empty()) cfg_.indexFiles = vh->indexFiles;
+            // Per-vhost SPA settings
+            if(vh->spaFallback) {
+                cfg_.spaFallback  = true;
+                cfg_.spaIndex     = vh->spaIndex;
+                cfg_.spaApiPrefix = vh->spaApiPrefix;
+            }
+            // Add per-vhost response headers
+            for(const auto& [name, val] : vh->addHeaders)
+                resp.headers.set(name, val);
+        }
+    }
+
+    // ── Rewrite + Proxy pipeline ──────────────────────────────────────────────
+    if(runRewriteAndProxy(c, req, resp, vh)) return;
+
     std::string path;
     struct stat st{};
     int err = resolveStaticTarget(cfg_.docRoot, cfg_.indexFiles,
@@ -1424,6 +1514,35 @@ void Server::run() {
 
 void Server::workerMain(int httpFd, int httpsFd) {
     int nThreads = std::max(1, cfg_.threadsPerWorker);
+
+    // Build rewrite engines once per worker (after fork, before threads).
+    // Runs in the worker process; cfg_.yamlCfg is read-only from here on.
+    if(cfg_.yamlCfg) {
+        // Global rules
+        {
+            RewriteEngine eng;
+            std::string err;
+            if(!cfg_.yamlCfg->rewrites.empty()) {
+                if(!eng.compile(cfg_.yamlCfg->rewrites, err))
+                    fprintf(stderr, "[REWRITE] Global: %s\n", err.c_str());
+                else
+                    rewriteEngines_["__global__"] = std::move(eng);
+            }
+        }
+        // Per-vhost rules
+        for(const auto& vh : cfg_.yamlCfg->vhosts) {
+            if(!vh.rewrites.empty()) {
+                RewriteEngine eng;
+                std::string err;
+                if(!eng.compile(vh.rewrites, err))
+                    fprintf(stderr, "[REWRITE] vhost %s: %s\n",
+                            vh.name.c_str(), err.c_str());
+                else
+                    rewriteEngines_[vh.name] = std::move(eng);
+            }
+        }
+    }
+
     auto handler = makeHandler();
 
     // Create one EventLoop per I/O thread

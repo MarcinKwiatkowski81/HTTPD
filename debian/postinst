@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create httpd user/group if not present
+        if ! getent group httpd > /dev/null 2>&1; then
+            addgroup --system httpd
+        fi
+        if ! getent passwd httpd > /dev/null 2>&1; then
+            adduser --system --no-create-home --ingroup httpd \
+                    --shell /usr/sbin/nologin httpd
+        fi
+
+        # Ensure log directory
+        mkdir -p /var/log/httpd
+        chown httpd:httpd /var/log/httpd
+        chmod 750 /var/log/httpd
+
+        # Ensure default docroot
+        mkdir -p /var/www/httpd
+        chown httpd:httpd /var/www/httpd
+
+        # Reload systemd if present
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        ;;
+esac
+
+exit 0

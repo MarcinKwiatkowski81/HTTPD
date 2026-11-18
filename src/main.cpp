@@ -1,6 +1,7 @@
 // Copyright (C) 2025 Marcin Kwiatkowski
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Httpd-Commercial
 #include "EventLoop.h"
+#include "Config.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,12 +38,17 @@ static void usage(const char* prog) {
         "  -t <n>        I/O threads per worker  (default: 4)\n"
         "  -m <path>     Load module .so         (repeatable; default: auto)\n"
         "  -g <dir>      CGI directory under docroot (default: /cgi-bin)\n"
+        "  -S            SPA fallback: serve index.html for unknown routes\n"
+        "  -f <file>     YAML configuration file\n"
         "  -h            Show this help\n"
         "\n"
+        "  CLI flags override values from the YAML file.\n"
+        "\n"
         "Examples:\n"
+        "  %s -f /etc/httpd/httpd.yaml\n"
         "  %s -r /var/www -p 80\n"
         "  %s -r /var/www -c cert.pem -k key.pem -w 4\n",
-        prog, prog, prog);
+        prog, prog, prog, prog);
 }
 
 int main(int argc, char* argv[]) {
@@ -53,22 +59,72 @@ int main(int argc, char* argv[]) {
 
     httpd::ServerConfig cfg;
     bool userModules = false;
+    std::string yamlFile;
 
     int opt;
-    while((opt = getopt(argc, argv, "r:p:s:c:k:w:t:m:g:h")) != -1) {
+    while((opt = getopt(argc, argv, "f:r:p:s:c:k:w:t:m:g:Sh")) != -1) {
         switch(opt) {
-        case 'r': cfg.docRoot           = optarg;                      break;
-        case 'p': cfg.httpPort          = (uint16_t)atoi(optarg);      break;
-        case 's': cfg.httpsPort         = (uint16_t)atoi(optarg);      break;
+        case 'f': yamlFile              = optarg;                       break;
+        case 'r': cfg.docRoot           = optarg;                       break;
+        case 'p': cfg.httpPort          = (uint16_t)atoi(optarg);       break;
+        case 's': cfg.httpsPort         = (uint16_t)atoi(optarg);       break;
         case 'c': cfg.tls.certFile      = optarg; cfg.enableTls = true; break;
         case 'k': cfg.tls.keyFile       = optarg; cfg.enableTls = true; break;
-        case 'w': cfg.workers           = atoi(optarg);                break;
-        case 't': cfg.threadsPerWorker  = atoi(optarg);                break;
+        case 'w': cfg.workers           = atoi(optarg);                 break;
+        case 't': cfg.threadsPerWorker  = atoi(optarg);                 break;
         case 'm': cfg.modules.push_back({optarg,""}); userModules=true; break;
-        case 'g': cfg.cgi.cgiDir        = optarg;                      break;
+        case 'g': cfg.cgi.cgiDir        = optarg;                       break;
+        case 'S': cfg.spaFallback       = true;                         break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
+    }
+
+    if(!yamlFile.empty()) {
+        httpd::ConfigParser parser;
+        httpd::YamlConfig   ycfg;
+        std::string         yamlErr;
+        if(!parser.parseFile(yamlFile, ycfg, yamlErr)) {
+            fprintf(stderr, "[CONFIG] %s: %s\n", yamlFile.c_str(), yamlErr.c_str());
+            return 1;
+        }
+        httpd::ServerConfig dfl;
+        if(cfg.docRoot          == dfl.docRoot)          cfg.docRoot          = ycfg.docRoot;
+        if(cfg.httpPort         == dfl.httpPort)         cfg.httpPort         = ycfg.httpPort;
+        if(cfg.httpsPort        == dfl.httpsPort)        cfg.httpsPort        = ycfg.httpsPort;
+        if(cfg.workers          == dfl.workers)          cfg.workers          = ycfg.workers;
+        if(cfg.threadsPerWorker == dfl.threadsPerWorker) cfg.threadsPerWorker = ycfg.threadsPerWorker;
+        if(cfg.tls.certFile.empty() && !ycfg.certFile.empty()){
+            cfg.tls.certFile = ycfg.certFile; cfg.enableTls = true;
+        }
+        if(cfg.tls.keyFile.empty()  && !ycfg.keyFile.empty()){
+            cfg.tls.keyFile = ycfg.keyFile;   cfg.enableTls = true;
+        }
+        if(!ycfg.caFile.empty())   cfg.tls.caFile      = ycfg.caFile;
+        cfg.tls.enableKtls      = ycfg.ktls;
+        cfg.tls.enableHttp2     = ycfg.http2;
+        cfg.enableHttp2         = ycfg.http2;
+        if(cfg.cgi.cgiDir == dfl.cgi.cgiDir) cfg.cgi.cgiDir = ycfg.cgiDir;
+        cfg.cache.maxMemEntries = ycfg.cacheMaxEntries;
+        cfg.cache.maxMemBytes   = ycfg.cacheMaxMb * 1024 * 1024;
+        cfg.streamThreshold     = ycfg.streamThresholdKb * 1024;
+        cfg.accessLog           = ycfg.accessLog;
+        cfg.accessLogFile       = ycfg.accessLogFile;
+        cfg.keepAliveTimeout    = ycfg.keepAliveTimeout;
+        cfg.requestTimeout      = ycfg.requestTimeout;
+        cfg.maxConns            = ycfg.maxConns;
+        cfg.maxBodySize         = ycfg.maxBodyMb * 1024 * 1024;
+        cfg.indexFiles          = ycfg.indexFiles;
+        if(!cfg.spaFallback) {
+            cfg.spaFallback  = ycfg.spaFallback;
+            cfg.spaIndex     = ycfg.spaIndex;
+            cfg.spaApiPrefix = ycfg.spaApiPrefix;
+        }
+        for(const auto& m : ycfg.modules)
+            if(!m.empty()) cfg.modules.push_back({m, ""});
+        cfg.yamlCfg = std::make_shared<httpd::YamlConfig>(std::move(ycfg));
+        if(!cfg.yamlCfg->vhosts.empty())
+            cfg.vhostSelector = std::make_shared<httpd::VHostSelector>(*cfg.yamlCfg);
     }
 
     // Auto-load Lua module from same directory as binary if not overridden
@@ -97,6 +153,12 @@ int main(int argc, char* argv[]) {
     printf("  Workers        : %s\n",
            cfg.workers ? std::to_string(cfg.workers).c_str() : "auto (CPU count)");
     printf("  Threads/worker : %d\n", cfg.threadsPerWorker);
+    if(!yamlFile.empty())
+        printf("  Config file    : %s\n", yamlFile.c_str());
+    if(cfg.vhostSelector)
+        printf("  Virtual hosts  : %zu\n", cfg.yamlCfg->vhosts.size());
+    if(cfg.spaFallback)
+        printf("  SPA fallback   : %s\n", cfg.spaIndex.c_str());
     printf("\n");
 
     signal(SIGINT,  sigHandler);
