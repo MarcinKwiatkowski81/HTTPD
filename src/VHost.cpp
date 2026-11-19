@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Marcin Kwiatkowski
+ zapytania // Copyright (C) 2025 Marcin Kwiatkowski
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Httpd-Commercial
 #include "VHost.h"
 #include <algorithm>
