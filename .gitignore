@@ -1,0 +1,10 @@
+# Build output
+build/
+*.o
+*.a
+*.so
+
+# TLS material — never commit keys or certs
+*.pem
+*.key
+*.crt
