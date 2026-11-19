@@ -376,6 +376,42 @@ static int l_session_destroy(lua_State* L) {
     return 0;
 }
 
+// httpd.remote_addr()  →  client IP as string
+static int l_remote_addr(lua_State* L) {
+    if(auto* c = ctx(L)) if(c->rctx) {
+        // peerAddr is not stored on RequestCtx directly; we store it as a Lua
+        // global per-request so scripts can read it.
+        lua_getfield(L, LUA_REGISTRYINDEX, "httpd.remote_addr");
+        return 1;  // nil if not set
+    }
+    lua_pushstring(L, "0.0.0.0");
+    return 1;
+}
+
+// httpd.script_dir()  →  directory of the running script
+//   /var/www/panel/index.lhtml  →  "/var/www/panel"
+static int l_script_dir(lua_State* L) {
+    if(auto* c = ctx(L)) if(c->rctx && !c->rctx->scriptPath.empty()) {
+        const std::string& sp = c->rctx->scriptPath;
+        auto slash = sp.rfind('/');
+        if(slash != std::string::npos)
+            lua_pushlstring(L, sp.data(), slash);
+        else
+            lua_pushstring(L, ".");
+        return 1;
+    }
+    lua_pushstring(L, ".");
+    return 1;
+}
+
+// httpd.script_path()  →  absolute path of the running script
+static int l_script_path(lua_State* L) {
+    if(auto* c = ctx(L)) if(c->rctx)
+        { lua_pushstring(L, c->rctx->scriptPath.c_str()); return 1; }
+    lua_pushnil(L);
+    return 1;
+}
+
 // httpd.parse_form(body_str) → table  (URL-form-encoded decoder)
 static int l_parse_form(lua_State* L) {
     size_t len; const char* raw = luaL_checklstring(L, 1, &len);
@@ -436,6 +472,9 @@ static const luaL_Reg kHttpdLib[] = {
     {"session_destroy",   l_session_destroy},
     // Utility
     {"parse_form",        l_parse_form},
+    {"remote_addr",       l_remote_addr},
+    {"script_dir",        l_script_dir},
+    {"script_path",       l_script_path},
     {nullptr, nullptr}
 };
 
@@ -522,6 +561,12 @@ static void storeChunk(lua_State* L, const std::string& path,
 static std::mutex              gStateMu;
 static std::unordered_map<pthread_t, lua_State*> gStates;
 
+// Registry key under which we store the baseline package.path.
+// Set once per state in getState(); restored-and-extended per request in
+// httpd_module_handle so that require() always finds modules relative to
+// the running script without accumulating duplicate entries across requests.
+static constexpr const char* kBasePath = "httpd.basepath";
+
 static lua_State* getState() {
     pthread_t self = pthread_self();
     {
@@ -531,10 +576,21 @@ static lua_State* getState() {
     }
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
+
     // Register httpd table
     luaL_newlib(L, kHttpdLib);
     lua_setglobal(L, "httpd");
     resetChunkCache(L);
+
+    // Snapshot the default package.path set by luaL_openlibs so we can
+    // prepend per-request script directories without accumulation.
+    lua_getglobal(L, "package");
+    lua_getfield(L, -1, "path");
+    const char* defpath = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+    lua_pushstring(L, defpath);                          // copy
+    lua_setfield(L, LUA_REGISTRYINDEX, kBasePath);       // registry[kBasePath] = copy
+    lua_pop(L, 2);  // pop path string + package table
+
     {
         std::lock_guard<std::mutex> lk(gStateMu);
         gStates[self] = L;
@@ -705,6 +761,64 @@ HTTPD_EXPORT int httpd_module_handle(httpd::RequestCtx* ctx_ptr) {
         return 0;
 
     lua_State* L = getState();
+
+    // ── Per-request package.path fixup ────────────────────────────────────────
+    // Set package.path = scriptDir + basepath every request, overwriting the
+    // previous value. This guarantees:
+    //   1. require("lib.foo") finds <scriptDir>/lib/foo.lua regardless of the
+    //      server's working directory at startup.
+    //   2. No duplicate path segments accumulate across requests (the same
+    //      Lua state handles thousands of requests over its lifetime).
+    {
+        // Derive the directory containing the script:
+        //   /var/www/panel/index.lhtml  →  /var/www/panel
+        const std::string& sp = ctx_ptr->scriptPath;
+        auto slash = sp.rfind('/');
+        std::string scriptDir = (slash != std::string::npos)
+                                    ? sp.substr(0, slash)
+                                    : std::string(".");
+
+        // Retrieve the baseline path snapshotted at state creation.
+        lua_getfield(L, LUA_REGISTRYINDEX, kBasePath);
+        const char* base = lua_isstring(L, -1) ? lua_tostring(L, -1) : "";
+
+        // Build: scriptDir/?.lua ; scriptDir/?/init.lua ; <base>
+        std::string newpath;
+        newpath.reserve(scriptDir.size() * 2 + strlen(base) + 32);
+        newpath += scriptDir; newpath += "/?.lua;";
+        newpath += scriptDir; newpath += "/?/init.lua;";
+        newpath += base;
+
+        lua_pop(L, 1);  // pop base string
+
+        lua_getglobal(L, "package");
+        lua_pushstring(L, newpath.c_str());
+        lua_setfield(L, -2, "path");
+        lua_pop(L, 1);  // pop package
+    }
+
+    // Store peer address in registry so httpd.remote_addr() can read it.
+    // Prefer X-Forwarded-For (leftmost entry) when behind a reverse proxy,
+    // fall back to the direct TCP peer address from RequestCtx.
+    {
+        std::string addr;
+        auto xff = ctx_ptr->req->headers.get("x-forwarded-for");
+        if(!xff.empty()) {
+            auto comma = xff.find(',');
+            addr = (comma != std::string_view::npos)
+                       ? std::string(xff.substr(0, comma))
+                       : std::string(xff);
+            // Strip whitespace
+            while(!addr.empty() && addr.front()==' ') addr.erase(addr.begin());
+            while(!addr.empty() && addr.back() ==' ') addr.pop_back();
+        } else if(!ctx_ptr->peerAddr.empty()) {
+            addr = ctx_ptr->peerAddr;
+        } else {
+            addr = "unknown";
+        }
+        lua_pushstring(L, addr.c_str());
+        lua_setfield(L, LUA_REGISTRYINDEX, "httpd.remote_addr");
+    }
 
     // Bind context to this thread
     LuaReqCtx lrc;

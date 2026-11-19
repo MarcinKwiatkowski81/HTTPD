@@ -18,6 +18,7 @@ struct RequestCtx {
     std::string  docRoot;
     std::string  scriptPath;
     std::string  pathInfo;
+    std::string  peerAddr;           // client IP:port (set by EventLoop)
     bool         handled   = false;  // set to true to skip further processing
 };
 

@@ -62,17 +62,21 @@ install -m 0644 "$SCRIPT_DIR/README.md" \
 gzip -9 -n --keep "$STAGE/usr/share/doc/$PKG_NAME/README.md" 2>/dev/null || true
 
 # ── DEBIAN/control ────────────────────────────────────────────────────────────
-cat > "$STAGE/DEBIAN/control" <<CTRL
-Package: $PKG_NAME
-Version: ${PKG_VER}-${PKG_REL}
-Architecture: $ARCH
-Maintainer: Marcin Kwiatkowski <marcin@example.com>
-Section: httpd
-Priority: optional
-Depends: libssl3 (>= 3.0) | libssl1.1, zlib1g (>= 1.2), liblua5.4-0
-Recommends: lua5.4, lua-socket, lua-sql-sqlite3
-Suggests: certbot
-Description: httpd — C++17 HTTP/1.1+HTTP/2 application server
+# Uwaga: single-quoted heredoc ('CTRL') wyłącza ekspansję $zmiennych w opisie,
+# więc dynamiczne pola (Package, Version, …) zapisujemy osobno przez printf.
+{
+    printf 'Package: %s\n'          "$PKG_NAME"
+    printf 'Version: %s-%s\n'       "$PKG_VER" "$PKG_REL"
+    printf 'Architecture: %s\n'     "$ARCH"
+    printf 'Maintainer: %s\n'       "Marcin Kwiatkowski <marcin@example.com>"
+    printf 'Section: %s\n'          "httpd"
+    printf 'Priority: %s\n'         "optional"
+    printf 'Depends: %s\n'          "libssl3 (>= 3.0) | libssl1.1, zlib1g (>= 1.2), liblua5.4-0"
+    printf 'Recommends: %s\n'       "lua5.4, lua-socket, lua-sql-sqlite3"
+    printf 'Suggests: %s\n'         "certbot"
+    # Opis — single-quoted heredoc, brak ekspansji $, $1, $9 itp.
+    cat <<'CTRL'
+Description: httpd - C++17 HTTP/1.1+HTTP/2 application server
  From-scratch C++17 HTTP server implementing RFC 9112/9113/9111/9110.
  .
  Features:
@@ -84,11 +88,12 @@ Description: httpd — C++17 HTTP/1.1+HTTP/2 application server
   * CGI/1.1 (fork-based)
   * Lua 5.4 scripting (.lua / .lhtml templates)
   * Virtual hosts (name-based, wildcard, SNI per-vhost cert)
-  * URL rewrite engine (ECMAScript regex, $1-$9 back-refs, flags)
+  * URL rewrite engine (ECMAScript regex, \$1-\$9 back-refs, flags)
   * Reverse proxy (HTTP upstream, X-Forwarded-For, hop-by-hop strip)
   * YAML configuration file
   * Pre-fork + epoll + thread-pool process model
 CTRL
+} > "$STAGE/DEBIAN/control"
 
 # ── DEBIAN/conffiles ──────────────────────────────────────────────────────────
 echo "/etc/httpd/httpd.yaml" > "$STAGE/DEBIAN/conffiles"

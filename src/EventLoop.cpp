@@ -1196,8 +1196,11 @@ void Server::dispatchRequest(Connection* c, RawRequest& req, RawResponse& resp) 
         auto* mod = modules_->findByExt(ext);
         if(mod && mod->handle_fn) {
             RequestCtx ctx;
-            ctx.req = &req; ctx.resp = &resp;
-            ctx.docRoot = cfg_.docRoot; ctx.scriptPath = path;
+            ctx.req        = &req;
+            ctx.resp       = &resp;
+            ctx.docRoot    = cfg_.docRoot;
+            ctx.scriptPath = path;
+            ctx.peerAddr   = c ? c->peerAddr : "";
             if(mod->handle_fn(&ctx) > 0 || ctx.handled) return;
         }
     }
